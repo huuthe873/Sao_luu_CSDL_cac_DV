@@ -28,6 +28,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
 
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
       - name: Truy vấn D1 và Thực thi Sao lưu (Chạy theo lô)
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
