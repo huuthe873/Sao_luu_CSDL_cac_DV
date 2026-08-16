@@ -2,7 +2,7 @@ name: Sao lưu CSDL Supabase
 
 on:
   schedule:
-    - cron: '0 * * * *' # Cảnh báo: nên đổi thành chạy 1-2 lần/ngày nếu số lượng trường lớn
+    - cron: '0 * * * *' 
   workflow_dispatch: 
 
 jobs:
@@ -14,7 +14,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Thêm Node.js để chạy script truy vấn Cloudflare API
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
@@ -54,8 +53,8 @@ jobs:
               console.log('--- Bước 1: Lấy danh sách kết nối từ Cloudflare D1 ---');
               const d1ApiUrl = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/d1/database/${cfDbId}/query`;
               
-              // Lấy chuỗi kết nối postgres (db_url) và tên để làm file (ten_truong)
-              const query = "SELECT db_url, ten_truong FROM danh_sach_truong";
+              // Cập nhật tên cột theo yêu cầu: supabase_sql (chuỗi kết nối) và slug (tên trường)
+              const query = "SELECT supabase_sql, slug FROM danh_sach_truong";
 
               const d1Response = await fetch(d1ApiUrl, {
                 method: 'POST',
@@ -79,52 +78,58 @@ jobs:
 
               console.log(`Đã tìm thấy ${results.length} trường. Bắt đầu sao lưu...`);
 
-              // Tạo thư mục backups nếu chưa có
               if (!fs.existsSync('backups')) {
                 fs.mkdirSync('backups');
               }
 
-              // Lấy ngày giờ làm đuôi file (VD: 2026-08-16_13-00-00)
+              // Khởi tạo thời gian (định dạng: Giờ-Phút-Giây_Ngày-Tháng-Năm)
               const now = new Date();
-              const dateStr = now.toISOString().replace(/T/, '_').replace(/:/g, '-').split('.')[0];
+              const hh = String(now.getHours()).padStart(2, '0');
+              const min = String(now.getMinutes()).padStart(2, '0');
+              const ss = String(now.getSeconds()).padStart(2, '0');
+              const dd = String(now.getDate()).padStart(2, '0');
+              const mm = String(now.getMonth() + 1).padStart(2, '0'); // Tháng bắt đầu từ 0
+              const yyyy = now.getFullYear();
+              
+              const dateStr = `${hh}-${min}-${ss}_${dd}-${mm}-${yyyy}`;
 
               let successCount = 0;
               let failCount = 0;
 
               console.log('\n--- Bước 2: Tiến hành sao lưu (Chạy Tuần Tự) ---');
-              // Khác với lệnh DUY TRÌ chạy song song, việc BACKUP phải chạy tuần tự 
-              // để máy ảo không bị tràn RAM/Disk khi chạy cùng lúc hàng chục lệnh pg_dump
               
               for (let i = 0; i < results.length; i++) {
                 const truong = results[i];
-                const dbUrl = truong.db_url;
                 
-                // Lọc bỏ dấu cách và ký tự đặc biệt trong tên trường để làm tên file an toàn
-                const tenFileSafe = (truong.ten_truong || `backup_${i}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+                // Lấy dữ liệu từ các cột tương ứng
+                const dbUrl = truong.supabase_sql; 
+                
+                // Chuẩn hóa tên slug (lọc bỏ ký tự lạ để tránh lỗi file system)
+                const tenFileSafe = (truong.slug || `backup_truong_${i}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+                
+                // Cấu trúc tên file: slug_giờ-phút-giây_ngày-tháng-năm.sql
+                const sqlFile = `backups/${tenFileSafe}_${dateStr}.sql`;
                 
                 console.log(`\n[${i + 1}/${results.length}] Đang sao lưu: ${tenFileSafe}`);
 
                 if (!dbUrl) {
-                  console.error('  -> BỎ QUA: Thiếu chuỗi kết nối db_url.');
+                  console.error('  -> BỎ QUA: Thiếu chuỗi kết nối (supabase_sql).');
                   failCount++;
                   continue;
                 }
 
-                const sqlFile = `backups/${tenFileSafe}-${dateStr}.sql`;
-
                 try {
-                  // 1. Thực thi lệnh pg_dump
+                  // Thực thi lệnh pg_dump
                   const cmd = `/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --clean --if-exists --quote-all-identifiers > ${sqlFile}`;
                   execSync(cmd, { stdio: 'pipe' });
                   
-                  // 2. Nén file lại thành .gz để tiết kiệm dung lượng Git
+                  // Nén file
                   execSync(`gzip ${sqlFile}`);
                   
                   console.log(`  -> ✅ Thành công: ${sqlFile}.gz`);
                   successCount++;
                 } catch (error) {
                   console.error(`  -> ❌ THẤT BẠI: Quá trình pg_dump gặp lỗi.`);
-                  // Dọn dẹp file lỗi để tránh push file rác lên Git
                   if (fs.existsSync(sqlFile)) fs.unlinkSync(sqlFile);
                   if (fs.existsSync(`${sqlFile}.gz`)) fs.unlinkSync(`${sqlFile}.gz`);
                   failCount++;
@@ -149,7 +154,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Đã cập nhật: Xóa các bản sao lưu cũ (*.sql.gz) hơn 30 ngày
+          # Xóa các bản sao lưu cũ (*.sql.gz) hơn 30 ngày
           find backups/ -name "*.sql.gz" -mtime +30 -type f -delete
           
           git add -A backups/
