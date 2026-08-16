@@ -2,8 +2,8 @@ name: Sao lưu CSDL Supabase
 
 on:
   schedule:
-    # Chạy 2 lần 1 ngày: 5h và 17h UTC (tương đương 12h trưa và 24h đêm giờ VN)
-    - cron: '0 5,17 * * *'
+    # 18:00 UTC tương đương 01:00 sáng giờ Việt Nam
+    - cron: '0 18 * * *' 
   workflow_dispatch: 
 
 jobs:
@@ -30,7 +30,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client-17
 
-      - name: Truy vấn D1 và Thực thi Sao lưu
+      - name: Truy vấn D1 và Thực thi Sao lưu (Chạy theo lô)
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
@@ -38,7 +38,8 @@ jobs:
         run: |
           cat << 'EOF' > backup_script.js
           const fs = require('fs');
-          const { execSync } = require('child_process');
+          const util = require('util');
+          const exec = util.promisify(require('child_process').exec); // Sử dụng exec bất đồng bộ
 
           const cfAccountId = process.env.CF_ACCOUNT_ID;
           const cfApiToken = process.env.CF_API_TOKEN;
@@ -78,7 +79,6 @@ jobs:
 
               console.log(`Đã tìm thấy ${results.length} trường. Bắt đầu sao lưu...`);
 
-              // Tạo thư mục gốc 'backups' nếu chưa có
               if (!fs.existsSync('backups')) {
                 fs.mkdirSync('backups');
               }
@@ -96,51 +96,65 @@ jobs:
               let successCount = 0;
               let failCount = 0;
 
-              console.log('\n--- Bước 2: Tiến hành sao lưu (Phân loại theo thư mục) ---');
-              
-              for (let i = 0; i < results.length; i++) {
-                const truong = results[i];
-                const dbUrl = truong.supabase_sql; 
-                const tenFileSafe = (truong.slug || `backup_truong_${i}`).replace(/[^a-zA-Z0-9_-]/g, '_');
-                
-                console.log(`\n[${i + 1}/${results.length}] Đang xử lý: ${tenFileSafe}`);
+              // --- BẮT ĐẦU CẤU HÌNH BATCHING (CHẠY THEO LÔ) ---
+              const batchSize = 5; 
+              console.log(`\n--- Bước 2: Tiến hành sao lưu (Chạy ${batchSize} trường cùng lúc) ---`);
 
-                if (!dbUrl) {
-                  console.error('  -> BỎ QUA: Thiếu chuỗi kết nối (supabase_sql).');
-                  failCount++;
-                  continue;
-                }
+              for (let i = 0; i < results.length; i += batchSize) {
+                // Cắt ra một cụm gồm 5 trường
+                const batch = results.slice(i, i + batchSize);
+                const thutu = `${i + 1} đến ${Math.min(i + batchSize, results.length)}`;
+                console.log(`\n⏳ Đang xử lý lô từ trường ${thutu}...`);
 
-                // TẠO THƯ MỤC RIÊNG CHO TRƯỜNG NÀY (Nếu chưa tồn tại)
-                const truongDir = `backups/${tenFileSafe}`;
-                if (!fs.existsSync(truongDir)) {
-                  fs.mkdirSync(truongDir, { recursive: true });
-                  console.log(`  -> Đã tạo thư mục mới: ${truongDir}`);
-                }
-                
-                // Đưa file SQL vào trong thư mục riêng của trường đó
-                const sqlFile = `${truongDir}/${tenFileSafe}_${dateStr}.sql`;
-
-                try {
-                  // Thực thi lệnh pg_dump
-                  const cmd = `/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --clean --if-exists --quote-all-identifiers > ${sqlFile}`;
-                  execSync(cmd, { stdio: 'pipe' });
+                // Tạo danh sách các tác vụ chạy song song cho lô này
+                const batchPromises = batch.map(async (truong, indexInBatch) => {
+                  const absoluteIndex = i + indexInBatch;
+                  const dbUrl = truong.supabase_sql; 
+                  const tenFileSafe = (truong.slug || `backup_truong_${absoluteIndex}`).replace(/[^a-zA-Z0-9_-]/g, '_');
                   
-                  // Nén file
-                  execSync(`gzip ${sqlFile}`);
+                  if (!dbUrl) {
+                    throw new Error(`[${tenFileSafe}] Thiếu chuỗi kết nối (supabase_sql).`);
+                  }
+
+                  // Quản lý thư mục
+                  const truongDir = `backups/${tenFileSafe}`;
+                  if (!fs.existsSync(truongDir)) {
+                    fs.mkdirSync(truongDir, { recursive: true });
+                  }
                   
-                  console.log(`  -> ✅ Thành công: ${sqlFile}.gz`);
-                  successCount++;
-                } catch (error) {
-                  console.error(`  -> ❌ THẤT BẠI: Quá trình pg_dump gặp lỗi.`);
-                  if (fs.existsSync(sqlFile)) fs.unlinkSync(sqlFile);
-                  if (fs.existsSync(`${sqlFile}.gz`)) fs.unlinkSync(`${sqlFile}.gz`);
-                  failCount++;
-                }
+                  const sqlFile = `${truongDir}/${tenFileSafe}_${dateStr}.sql`;
+
+                  try {
+                    // Chạy lệnh pg_dump và gzip bằng exec (bất đồng bộ)
+                    const cmd = `/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --clean --if-exists --quote-all-identifiers > ${sqlFile}`;
+                    await exec(cmd);
+                    await exec(`gzip ${sqlFile}`);
+                    return `  -> ✅ Thành công: ${sqlFile}.gz`;
+                  } catch (error) {
+                    // Dọn dẹp file hỏng nếu lệnh thất bại
+                    if (fs.existsSync(sqlFile)) fs.unlinkSync(sqlFile);
+                    if (fs.existsSync(`${sqlFile}.gz`)) fs.unlinkSync(`${sqlFile}.gz`);
+                    throw new Error(`  -> ❌ THẤT BẠI [${tenFileSafe}]: Lỗi truy xuất.`);
+                  }
+                });
+
+                // Chờ cho toàn bộ 5 trường trong lô này chạy xong
+                const batchResults = await Promise.allSettled(batchPromises);
+
+                // Tổng hợp kết quả của lô
+                batchResults.forEach(res => {
+                  if (res.status === 'fulfilled') {
+                    console.log(res.value);
+                    successCount++;
+                  } else {
+                    console.error(res.reason.message);
+                    failCount++;
+                  }
+                });
               }
 
               console.log('\n--- TỔNG KẾT SAO LƯU ---');
-              console.log(`Thành công: ${successCount} | Thất bại: ${failCount}`);
+              console.log(`Thành công: ${successCount} | Thất bại: ${failCount} | Tổng số: ${results.length}`);
 
             } catch (err) {
               console.error('LỖI HỆ THỐNG TRẦM TRỌNG:', err.message);
@@ -157,7 +171,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Lệnh find tự động chui vào các thư mục con để xóa các file nén quá 30 ngày tuổi
+          # Lệnh xóa tự động vào mọi thư mục con để tìm xóa file > 30 ngày
           find backups/ -name "*.sql.gz" -mtime +30 -type f -delete
           
           git add -A backups/
