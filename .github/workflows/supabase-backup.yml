@@ -2,7 +2,8 @@ name: Sao lưu CSDL Supabase
 
 on:
   schedule:
-    - cron: '0 * * * *' 
+    # Đã sửa: Chạy vào phút thứ 0 của mỗi 3 giờ (VD: 0h, 3h, 6h, 9h...)
+    - cron: '0 */3 * * *' 
   workflow_dispatch: 
 
 jobs:
@@ -154,7 +155,7 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Xóa các bản sao lưu cũ (*.sql.gz) hơn 30 ngày
+          # Đã kiểm tra: Lệnh này quét thư mục backups và xóa các file .sql.gz cũ hơn 30 ngày
           find backups/ -name "*.sql.gz" -mtime +30 -type f -delete
           
           git add -A backups/
