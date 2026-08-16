@@ -2,7 +2,8 @@ name: Sao lưu CSDL Supabase
 
 on:
   schedule:
-    - cron: '0 */3 * * *' 
+    # Chạy 2 lần 1 ngày: 5h và 17h UTC (tương đương 12h trưa và 24h đêm giờ VN)
+    - cron: '0 5,17 * * *'
   workflow_dispatch: 
 
 jobs:
