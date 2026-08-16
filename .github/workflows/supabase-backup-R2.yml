@@ -1,4 +1,4 @@
-name: Sao lưu CSDL Supabase len Google Drive
+name: Sao lưu CSDL Supabase len Cloudflare R2
 
 on:
   schedule:
@@ -156,32 +156,33 @@ jobs:
           EOF
           node backup_script.js
 
-      - name: Upload to Google Drive & Cleanup Old Backups
+      - name: Upload to Cloudflare R2 & Cleanup Old Backups
         env:
-          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
         run: |
-          # 1. Lưu file JSON cấu hình từ Secret
-          echo "$GDRIVE_SA_JSON" > /tmp/sa.json
-          
-          # 2. Tạo file cấu hình rclone kết nối với Google Drive
+          # 1. Tạo file cấu hình rclone kết nối với Cloudflare R2
           mkdir -p ~/.config/rclone
           cat << EOF > ~/.config/rclone/rclone.conf
-          [gdrive]
-          type = drive
-          scope = drive
-          service_account_file = /tmp/sa.json
-          root_folder_id = $GDRIVE_FOLDER_ID
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $R2_ACCESS_KEY_ID
+          secret_access_key = $R2_SECRET_ACCESS_KEY
+          region = auto
+          endpoint = https://$CF_ACCOUNT_ID.r2.cloudflarestorage.com
           EOF
           
-          echo "🚀 Bắt đầu upload toàn bộ thư mục 'backups' lên Google Drive..."
-          # Lệnh copy: Tải các file mới lên. --transfers=4 giúp upload 4 file song song.
-          rclone copy backups/ gdrive: --transfers=4 --checkers=8 -v
+          echo "🚀 Bắt đầu upload toàn bộ thư mục 'backups' lên Cloudflare R2..."
+          # Lệnh copy: Tải các file lên thư mục "database_backups" trong bucket R2
+          rclone copy backups/ r2:$R2_BUCKET_NAME/database_backups/ --transfers=4 --checkers=8 -v
           
-          echo "🧹 Đang dọn dẹp các file sao lưu đã lưu quá 30 ngày trên Google Drive..."
-          # Lệnh delete: Quét và xóa các file rác/cũ hơn 30 ngày trực tiếp trên Cloud
-          rclone delete gdrive: --min-age 30d -v
+          echo "🧹 Đang dọn dẹp các file sao lưu đã lưu quá 30 ngày trên R2..."
+          # Lệnh delete: Quét và xóa các file rác/cũ hơn 30 ngày
+          rclone delete r2:$R2_BUCKET_NAME/database_backups/ --min-age 30d -v
           
-          # 3. Dọn dẹp để đảm bảo bảo mật
-          rm /tmp/sa.json
-          echo "✅ Đã hoàn tất sao lưu lên Google Drive!"
+          # Dọn dẹp config
+          rm ~/.config/rclone/rclone.conf
+          echo "✅ Đã hoàn tất sao lưu lên Cloudflare R2!"
