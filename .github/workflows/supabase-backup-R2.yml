@@ -1,0 +1,187 @@
+name: Sao lưu CSDL Supabase len Google Drive
+
+on:
+  schedule:
+    # 18:00 UTC tương đương 01:00 sáng giờ Việt Nam
+    - cron: '0 18 * * *' 
+  workflow_dispatch: 
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install PostgreSQL client 17
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Truy vấn D1 và Thực thi Sao lưu (Chạy theo lô)
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_D1_DB_ID: ${{ secrets.CF_D1_DB_ID }}
+        run: |
+          cat << 'EOF' > backup_script.js
+          const fs = require('fs');
+          const util = require('util');
+          const exec = util.promisify(require('child_process').exec);
+
+          const cfAccountId = process.env.CF_ACCOUNT_ID;
+          const cfApiToken = process.env.CF_API_TOKEN;
+          const cfDbId = process.env.CF_D1_DB_ID;
+
+          if (!cfAccountId || !cfApiToken || !cfDbId) {
+            console.error('LỖI: Thiếu biến môi trường Cloudflare Secrets.');
+            process.exit(1);
+          }
+
+          async function main() {
+            try {
+              console.log('--- Bước 1: Lấy danh sách kết nối từ Cloudflare D1 ---');
+              const d1ApiUrl = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/d1/database/${cfDbId}/query`;
+              
+              const query = "SELECT supabase_sql, slug FROM danh_sach_truong";
+
+              const d1Response = await fetch(d1ApiUrl, {
+                method: 'POST',
+                headers: {
+                  'Authorization': `Bearer ${cfApiToken}`,
+                  'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({ sql: query })
+              });
+
+              const d1Data = await d1Response.json();
+              if (!d1Data.success) {
+                throw new Error('Lỗi truy vấn D1: ' + JSON.stringify(d1Data.errors));
+              }
+
+              const results = d1Data.result[0].results;
+              if (!results || results.length === 0) {
+                console.log('Không có dữ liệu trong bảng danh_sach_truong.');
+                process.exit(0);
+              }
+
+              console.log(`Đã tìm thấy ${results.length} trường. Bắt đầu sao lưu...`);
+
+              if (!fs.existsSync('backups')) {
+                fs.mkdirSync('backups');
+              }
+
+              const now = new Date();
+              const hh = String(now.getHours()).padStart(2, '0');
+              const min = String(now.getMinutes()).padStart(2, '0');
+              const ss = String(now.getSeconds()).padStart(2, '0');
+              const dd = String(now.getDate()).padStart(2, '0');
+              const mm = String(now.getMonth() + 1).padStart(2, '0');
+              const yyyy = now.getFullYear();
+              
+              const dateStr = `${hh}-${min}-${ss}_${dd}-${mm}-${yyyy}`;
+
+              let successCount = 0;
+              let failCount = 0;
+
+              const batchSize = 5; 
+              console.log(`\n--- Bước 2: Tiến hành sao lưu (Chạy ${batchSize} trường cùng lúc) ---`);
+
+              for (let i = 0; i < results.length; i += batchSize) {
+                const batch = results.slice(i, i + batchSize);
+                const thutu = `${i + 1} đến ${Math.min(i + batchSize, results.length)}`;
+                console.log(`\n⏳ Đang xử lý lô từ trường ${thutu}...`);
+
+                const batchPromises = batch.map(async (truong, indexInBatch) => {
+                  const absoluteIndex = i + indexInBatch;
+                  const dbUrl = truong.supabase_sql; 
+                  const tenFileSafe = (truong.slug || `backup_truong_${absoluteIndex}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+                  
+                  if (!dbUrl) {
+                    throw new Error(`[${tenFileSafe}] Thiếu chuỗi kết nối (supabase_sql).`);
+                  }
+
+                  const truongDir = `backups/${tenFileSafe}`;
+                  if (!fs.existsSync(truongDir)) {
+                    fs.mkdirSync(truongDir, { recursive: true });
+                  }
+                  
+                  const sqlFile = `${truongDir}/${tenFileSafe}_${dateStr}.sql`;
+
+                  try {
+                    const cmd = `/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --clean --if-exists --quote-all-identifiers > ${sqlFile}`;
+                    await exec(cmd);
+                    await exec(`gzip ${sqlFile}`);
+                    return `  -> ✅ Thành công: ${sqlFile}.gz`;
+                  } catch (error) {
+                    if (fs.existsSync(sqlFile)) fs.unlinkSync(sqlFile);
+                    if (fs.existsSync(`${sqlFile}.gz`)) fs.unlinkSync(`${sqlFile}.gz`);
+                    throw new Error(`  -> ❌ THẤT BẠI [${tenFileSafe}]: Lỗi truy xuất.`);
+                  }
+                });
+
+                const batchResults = await Promise.allSettled(batchPromises);
+
+                batchResults.forEach(res => {
+                  if (res.status === 'fulfilled') {
+                    console.log(res.value);
+                    successCount++;
+                  } else {
+                    console.error(res.reason.message);
+                    failCount++;
+                  }
+                });
+              }
+
+              console.log('\n--- TỔNG KẾT SAO LƯU ---');
+              console.log(`Thành công: ${successCount} | Thất bại: ${failCount} | Tổng số: ${results.length}`);
+
+            } catch (err) {
+              console.error('LỖI HỆ THỐNG TRẦM TRỌNG:', err.message);
+              process.exit(1);
+            }
+          }
+
+          main();
+          EOF
+          node backup_script.js
+
+      - name: Upload to Google Drive & Cleanup Old Backups
+        env:
+          GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          # 1. Lưu file JSON cấu hình từ Secret
+          echo "$GDRIVE_SA_JSON" > /tmp/sa.json
+          
+          # 2. Tạo file cấu hình rclone kết nối với Google Drive
+          mkdir -p ~/.config/rclone
+          cat << EOF > ~/.config/rclone/rclone.conf
+          [gdrive]
+          type = drive
+          scope = drive
+          service_account_file = /tmp/sa.json
+          root_folder_id = $GDRIVE_FOLDER_ID
+          EOF
+          
+          echo "🚀 Bắt đầu upload toàn bộ thư mục 'backups' lên Google Drive..."
+          # Lệnh copy: Tải các file mới lên. --transfers=4 giúp upload 4 file song song.
+          rclone copy backups/ gdrive: --transfers=4 --checkers=8 -v
+          
+          echo "🧹 Đang dọn dẹp các file sao lưu đã lưu quá 30 ngày trên Google Drive..."
+          # Lệnh delete: Quét và xóa các file rác/cũ hơn 30 ngày trực tiếp trên Cloud
+          rclone delete gdrive: --min-age 30d -v
+          
+          # 3. Dọn dẹp để đảm bảo bảo mật
+          rm /tmp/sa.json
+          echo "✅ Đã hoàn tất sao lưu lên Google Drive!"
