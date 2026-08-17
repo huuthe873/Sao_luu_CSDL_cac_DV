@@ -1,4 +1,4 @@
-name: Phục hồi CSDL Supabase từ R2
+name: Phục hồi CSDL Supabase
 
 on:
   workflow_dispatch:
