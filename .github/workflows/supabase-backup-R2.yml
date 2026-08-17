@@ -1,4 +1,4 @@
-name: Sao lưu CSDL Supabase len Cloudflare R2
+name: Sao lưu CSDL Supabase len Cloudflare R2 - full truong
 
 on:
   schedule:
