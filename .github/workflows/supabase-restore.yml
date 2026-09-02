@@ -20,7 +20,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: '20' # Node 20 là bản LTS (Long Term Support) ổn định nhất cho GitHub Actions
 
       - name: Install PostgreSQL client 17
         run: |
@@ -66,13 +66,16 @@ jobs:
           const fs = require('fs');
           const util = require('util');
           const exec = util.promisify(require('child_process').exec);
+          
+          // Tăng buffer lên 10MB để không sập tiến trình khi log trả về quá nhiều
+          const execOptions = { maxBuffer: 1024 * 1024 * 10 };
 
           const cfAccountId = process.env.CF_ACCOUNT_ID;
           const cfApiToken = process.env.CF_API_TOKEN;
           const cfDbId = process.env.CF_D1_DB_ID;
           const r2Bucket = process.env.R2_BUCKET_NAME;
           
-          // Làm sạch input để chống lỗi
+          // Làm sạch input (Slug chỉ cho phép chữ, số, gạch ngang, gạch dưới)
           const slug = process.env.INPUT_SLUG.replace(/[^a-zA-Z0-9_-]/g, '');
           const fileReq = process.env.INPUT_FILE.trim();
 
@@ -105,10 +108,10 @@ jobs:
 
               let fileToDownload = fileReq;
 
-              // 1. Nếu yêu cầu "latest", dùng rclone quét thư mục của trường để lấy file mới nhất
+              // 1. Tự động lấy file mới nhất nếu người dùng để "latest"
               if (fileReq.toLowerCase() === 'latest') {
-                console.log(`🔍 Đang tìm file sao lưu mới nhất trên R2 cho thư mục ${slug}...`);
-                const { stdout } = await exec(`rclone lsjson r2:${r2Bucket}/database_backups/${slug}/`);
+                console.log(`🔍 Đang tìm file sao lưu mới nhất trên R2 cho thư mục [${slug}]...`);
+                const { stdout } = await exec(`rclone lsjson r2:${r2Bucket}/database_backups/${slug}/`, execOptions);
                 const files = JSON.parse(stdout);
                 
                 const sqlFiles = files.filter(f => f.Path.endsWith('.sql.gz'));
@@ -116,46 +119,58 @@ jobs:
                   throw new Error(`❌ Không có file backup nào (.sql.gz) trong thư mục của trường ${slug}.`);
                 }
                 
-                // Sắp xếp theo thời gian mới nhất (ModTime)
+                // Sắp xếp theo ModTime mới nhất
                 sqlFiles.sort((a, b) => new Date(b.ModTime) - new Date(a.ModTime));
                 fileToDownload = sqlFiles[0].Path;
                 console.log(`✅ File mới nhất tìm thấy: ${fileToDownload}`);
               }
 
-              // Lấy tên file thực tế khi lưu xuống local
               const localFileName = fileToDownload.split('/').pop();
 
-              // 2. Tải file từ Cloudflare R2 về
+              // 2. Tải file từ Cloudflare R2
               console.log(`⬇️ Đang tải file ${fileToDownload} từ R2...`);
-              await exec(`rclone copy "r2:${r2Bucket}/database_backups/${slug}/${fileToDownload}" ./`);
+              await exec(`rclone copy "r2:${r2Bucket}/database_backups/${slug}/${fileToDownload}" ./`, execOptions);
               
               if (!fs.existsSync(localFileName)) {
-                throw new Error("❌ Không tải được file từ R2. Vui lòng kiểm tra lại tên file.");
+                throw new Error("❌ Không tải được file từ R2. Vui lòng kiểm tra lại đường dẫn và tên file.");
               }
 
-              // 3. Giải nén file
+              // 3. Giải nén
               console.log(`📦 Đang giải nén file...`);
-              await exec(`gunzip -f "${localFileName}"`);
+              await exec(`gunzip -f "${localFileName}"`, execOptions);
               const sqlFile = localFileName.replace('.gz', '');
 
-              // 4. Phục hồi dữ liệu
-              console.log(`🔥 ĐANG BẮT ĐẦU PHỤC HỒI DỮ LIỆU... (Có thể mất vài phút)`);
-              const { stdout: psqlOut, stderr: psqlErr } = await exec(`psql "${dbUrl}" -f "${sqlFile}"`);
+              // 4. Bơm dữ liệu vào CSDL
+              console.log(`🔥 ĐANG BẮT ĐẦU PHỤC HỒI DỮ LIỆU... (Tiến trình này sẽ mất vài phút)`);
               
-              if (psqlErr && !psqlErr.includes('NOTICE')) {
-                 console.log("⚠️ Cảnh báo từ psql:", psqlErr);
+              const { stdout: psqlOut, stderr: psqlErr } = await exec(`psql "${dbUrl}" -f "${sqlFile}"`, execOptions);
+              
+              // Bóc tách lỗi thực sự (Bỏ qua các NOTICE nội bộ của PostgreSQL)
+              if (psqlErr) {
+                const errorLines = psqlErr.split('\n').filter(line => line.includes('ERROR:') || line.includes('FATAL:'));
+                if (errorLines.length > 0) {
+                  console.warn("\n⚠️ CẢNH BÁO TỪ POSTGRESQL (Tiến trình không dừng nhưng có thể có dữ liệu bị lỗi):");
+                  console.warn(errorLines.join('\n'));
+                  console.warn("--------------------------------------------------\n");
+                }
               }
 
-              console.log("🎉 PHỤC HỒI THÀNH CÔNG 100%!");
+              console.log("🎉 PHỤC HỒI THÀNH CÔNG! HỆ THỐNG ĐÃ SẴN SÀNG.");
               
-              // Dọn dẹp file thừa
+              // 5. Dọn rác server
               if (fs.existsSync(sqlFile)) fs.unlinkSync(sqlFile);
 
             } catch (err) {
-              console.error(err.message);
+              // Bắt lỗi hệ thống, cắt lấy dòng lỗi chính (tránh đổ log rác vô nghĩa)
+              console.error(err.message.split('\n')[0]);
               process.exit(1);
             }
           }
           main();
           EOF
           node restore_script.js
+
+      - name: Xóa cấu hình Rclone (Bảo mật)
+        run: |
+          rm -f ~/.config/rclone/rclone.conf
+          echo "🔒 Đã dọn dẹp sạch key xác thực R2."
