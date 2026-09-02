@@ -47,13 +47,14 @@ jobs:
           cat << 'EOF' > backup_script.js
           const fs = require('fs');
           const util = require('util');
+          // Tăng maxBuffer lên 10MB để tránh tràn bộ đệm khi bắt log lỗi của pg_dump
           const exec = util.promisify(require('child_process').exec);
+          const execOptions = { maxBuffer: 1024 * 1024 * 10 }; 
 
           const cfAccountId = process.env.CF_ACCOUNT_ID;
           const cfApiToken = process.env.CF_API_TOKEN;
           const cfDbId = process.env.CF_D1_DB_ID;
           
-          // Lấy giá trị input từ người dùng (nếu có)
           const inputSlug = process.env.INPUT_SLUG ? process.env.INPUT_SLUG.trim() : "";
 
           if (!cfAccountId || !cfApiToken || !cfDbId) {
@@ -68,7 +69,6 @@ jobs:
               let query = "SELECT supabase_sql, slug FROM danh_sach_truong";
               let bodyPayload = { sql: query };
 
-              // NẾU CÓ NHẬP SLUG -> Chỉ lấy đúng 1 trường đó
               if (inputSlug) {
                 console.log(`--- CHẾ ĐỘ: Chỉ sao lưu trường [${inputSlug}] ---`);
                 query += " WHERE slug = ?";
@@ -140,14 +140,24 @@ jobs:
                   const sqlFile = `${truongDir}/${tenFileSafe}_${dateStr}.sql`;
 
                   try {
-                    const cmd = `/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --clean --if-exists --quote-all-identifiers > ${sqlFile}`;
-                    await exec(cmd);
-                    await exec(`gzip ${sqlFile}`);
+                    // 1. Xuất dữ liệu (Đã thêm --no-owner để file sao lưu hoàn toàn độc lập và không dính lỗi tài khoản admin của Supabase)
+                    const cmd = `/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --clean --if-exists --no-owner --quote-all-identifiers > "${sqlFile}"`;
+                    await exec(cmd, execOptions);
+
+                    // 2. Làm sạch file SQL nội bộ của Supabase (Loại bỏ Event Triggers)
+                    await exec(`perl -0777 -pi -e 's/CREATE EVENT TRIGGER.*?;//gs' "${sqlFile}"`, execOptions);
+                    await exec(`perl -0777 -pi -e 's/ALTER EVENT TRIGGER.*?;//gs' "${sqlFile}"`, execOptions);
+                    await exec(`perl -0777 -pi -e 's/DROP EVENT TRIGGER.*?;//gs' "${sqlFile}"`, execOptions);
+                    await exec(`perl -0777 -pi -e 's/COMMENT ON EVENT TRIGGER.*?;//gs' "${sqlFile}"`, execOptions);
+
+                    // 3. Nén dữ liệu sau khi đã làm sạch
+                    await exec(`gzip "${sqlFile}"`, execOptions);
                     return `  -> ✅ Thành công: ${sqlFile}.gz`;
                   } catch (error) {
+                    // Dọn dẹp file rác nếu tiến trình lỗi
                     if (fs.existsSync(sqlFile)) fs.unlinkSync(sqlFile);
                     if (fs.existsSync(`${sqlFile}.gz`)) fs.unlinkSync(`${sqlFile}.gz`);
-                    throw new Error(`  -> ❌ THẤT BẠI [${tenFileSafe}]: Lỗi truy xuất.`);
+                    throw new Error(`  -> ❌ THẤT BẠI [${tenFileSafe}]: ${error.message.split('\n')[0]}`);
                   }
                 });
 
