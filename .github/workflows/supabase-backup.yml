@@ -2,8 +2,8 @@ name: Sao lưu CSDL Supabase len Cloudflare R2 - chon truong
 
 on:
   schedule:
-    # 18:00 UTC tương đương 01:00 sáng giờ Việt Nam
-    - cron: '0 18 * * *' 
+    # 05:00 UTC (12:00 trưa giờ VN) và 18:00 UTC (01:00 sáng giờ VN)
+    - cron: '0 5,18 * * *'
   workflow_dispatch:
     inputs:
       truong_slug:
