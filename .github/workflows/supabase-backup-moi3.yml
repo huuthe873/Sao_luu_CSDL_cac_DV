@@ -1,0 +1,243 @@
+name: Sao lưu CSDL Supabase len Cloudflare R2 - chon truong moi3
+
+on:
+  schedule:
+    # 05:00 UTC (12:00 trưa giờ VN) và 18:00 UTC (01:00 sáng giờ VN)
+    - cron: '0 5,18 * * *'
+  workflow_dispatch:
+    inputs:
+      truong_slug:
+        description: 'Nhập slug của trường cần sao lưu (Để TRỐNG nếu muốn sao lưu TOÀN BỘ)'
+        required: false
+        type: string
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install PostgreSQL client 17
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Truy vấn D1 và Thực thi Sao lưu
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_D1_DB_ID: ${{ secrets.CF_D1_DB_ID }}
+          INPUT_SLUG: ${{ github.event.inputs.truong_slug }}
+        run: |
+          cat << 'EOF' > backup_script.js
+          const fs = require('fs');
+          const util = require('util');
+          // Tăng maxBuffer lên 50MB để đảm bảo an toàn cho CSDL lớn
+          const exec = util.promisify(require('child_process').exec);
+          const execOptions = { maxBuffer: 1024 * 1024 * 50 };
+
+          const cfAccountId = process.env.CF_ACCOUNT_ID;
+          const cfApiToken = process.env.CF_API_TOKEN;
+          const cfDbId = process.env.CF_D1_DB_ID;
+          const inputSlug = process.env.INPUT_SLUG ? process.env.INPUT_SLUG.trim() : "";
+
+          if (!cfAccountId || !cfApiToken || !cfDbId) {
+            console.error('LỖI: Thiếu biến môi trường Cloudflare Secrets.');
+            process.exit(1);
+          }
+
+          // Danh sách toàn bộ các schema hệ thống của Supabase cần loại trừ
+          const excludeSchemas = [
+            'auth', 'storage', 'realtime', 'graphql', 'graphql_public',
+            'extensions', 'pgbouncer', 'pgsodium', 'pgsodium_masks',
+            'vault', 'cron', 'supabase_functions', 'supabase_migrations',
+            'net', '_realtime', '_analytics'
+          ].map(s => `--exclude-schema=${s}`).join(' ');
+
+          // TUYỆT ĐỐI KHÔNG dùng --clean --if-exists ở đây vì 1_pre_clean.sql đã dọn sạch bằng CASCADE
+          // Giúp loại bỏ 100% lỗi: ERROR: relation "public.xet_thidua" does not exist
+          const commonFlags = `--no-owner --no-privileges --no-publications --no-subscriptions --quote-all-identifiers ${excludeSchemas}`;
+
+          async function main() {
+            try {
+              const d1ApiUrl = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/d1/database/${cfDbId}/query`;
+              let query = "SELECT supabase_sql, slug FROM danh_sach_truong";
+              let bodyPayload = { sql: query };
+
+              if (inputSlug) {
+                console.log(`--- CHẾ ĐỘ: Chỉ sao lưu trường [${inputSlug}] ---`);
+                query += " WHERE slug = ?";
+                bodyPayload = { sql: query, params: [inputSlug] };
+              } else {
+                console.log(`--- CHẾ ĐỘ: Sao lưu TOÀN BỘ danh sách trường ---`);
+              }
+
+              const d1Response = await fetch(d1ApiUrl, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${cfApiToken}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify(bodyPayload)
+              });
+
+              const d1Data = await d1Response.json();
+              if (!d1Data.success) throw new Error('Lỗi truy vấn D1: ' + JSON.stringify(d1Data.errors));
+
+              const results = d1Data.result[0].results;
+              if (!results || results.length === 0) {
+                console.log(inputSlug ? `❌ Không tìm thấy trường nào có slug là "${inputSlug}".` : '❌ Không có dữ liệu trong bảng danh_sach_truong.');
+                process.exit(0);
+              }
+
+              console.log(`✅ Đã tìm thấy ${results.length} trường. Bắt đầu sao lưu...`);
+
+              if (!fs.existsSync('backups')) fs.mkdirSync('backups');
+              
+              const now = new Date();
+              const dateStr = `${String(now.getHours()).padStart(2, '0')}-${String(now.getMinutes()).padStart(2, '0')}-${String(now.getSeconds()).padStart(2, '0')}_${String(now.getDate()).padStart(2, '0')}-${String(now.getMonth() + 1).padStart(2, '0')}-${now.getFullYear()}`;
+
+              let successCount = 0, failCount = 0;
+              const batchSize = 5;
+
+              for (let i = 0; i < results.length; i += batchSize) {
+                const batch = results.slice(i, i + batchSize);
+                const thutu = inputSlug ? "1 đến 1" : `${i + 1} đến ${Math.min(i + batchSize, results.length)}`;
+                console.log(`\n⏳ Đang xử lý lô từ trường ${thutu}...`);
+
+                const batchPromises = batch.map(async (truong, indexInBatch) => {
+                  const absoluteIndex = i + indexInBatch;
+                  const dbUrl = truong.supabase_sql;
+                  const tenFileSafe = (truong.slug || `backup_truong_${absoluteIndex}`).replace(/[^a-zA-Z0-9_-]/g, '_');
+                  if (!dbUrl) throw new Error(`[${tenFileSafe}] Thiếu chuỗi kết nối (supabase_sql).`);
+
+                  const truongDir = `backups/${tenFileSafe}`;
+                  if (!fs.existsSync(truongDir)) fs.mkdirSync(truongDir, { recursive: true });
+                  
+                  const sqlFile = `${truongDir}/${tenFileSafe}_${dateStr}.sql`;
+                  const f1PreClean = `${truongDir}/1_pre_clean.sql`;
+                  const f2AuthData = `${truongDir}/2_auth_data.sql`;
+                  const f3PublicFull = `${truongDir}/3_public_full.sql`;
+                  const tempFiles = [f1PreClean, f2AuthData, f3PublicFull];
+
+                  try {
+                    // GIAI ĐOẠN 1: Kịch bản dọn dẹp sạch 100% đối tượng người dùng trong public (bảo toàn đối tượng của Extension)
+                    const preCleanSql = [
+                      'SET check_function_bodies = false;',
+                      'DO $$ DECLARE r RECORD; BEGIN',
+                      '  -- 1. Xóa sạch View, Materialized View, Table, Sequence trong public (trừ đối tượng thuộc Extension)',
+                      '  FOR r IN (',
+                      '    SELECT c.relname, c.relkind FROM pg_class c JOIN pg_namespace n ON c.relnamespace = n.oid',
+                      '    WHERE n.nspname = \'public\' AND c.relkind IN (\'v\', \'m\', \'r\', \'p\', \'S\')',
+                      '      AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = \'e\')',
+                      '  ) LOOP',
+                      '    BEGIN',
+                      '      IF r.relkind = \'v\' THEN EXECUTE \'DROP VIEW IF EXISTS "public".\' || quote_ident(r.relname) || \' CASCADE;\';',
+                      '      ELSIF r.relkind = \'m\' THEN EXECUTE \'DROP MATERIALIZED VIEW IF EXISTS "public".\' || quote_ident(r.relname) || \' CASCADE;\';',
+                      '      ELSIF r.relkind IN (\'r\', \'p\') THEN EXECUTE \'DROP TABLE IF EXISTS "public".\' || quote_ident(r.relname) || \' CASCADE;\';',
+                      '      ELSIF r.relkind = \'S\' THEN EXECUTE \'DROP SEQUENCE IF EXISTS "public".\' || quote_ident(r.relname) || \' CASCADE;\';',
+                      '      END IF;',
+                      '    EXCEPTION WHEN OTHERS THEN NULL; END;',
+                      '  END LOOP;',
+                      '  -- 2. Xóa các Function/Procedure trong public; nếu hàm Trigger đang gắn với auth.users thì chuyển về No-Op',
+                      '  FOR r IN (',
+                      '    SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, p.prorettype',
+                      '    FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid',
+                      '    WHERE n.nspname = \'public\' AND p.prokind IN (\'f\', \'p\')',
+                      '      AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = \'e\')',
+                      '  ) LOOP',
+                      '    BEGIN',
+                      '      EXECUTE \'DROP ROUTINE IF EXISTS "public".\' || quote_ident(r.proname) || \'(\' || r.args || \');\';',
+                      '    EXCEPTION WHEN OTHERS THEN',
+                      '      IF r.prorettype = \'pg_catalog.trigger\'::regtype THEN',
+                      '        BEGIN EXECUTE \'CREATE OR REPLACE FUNCTION "public".\' || quote_ident(r.proname) || \'() RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN RETURN COALESCE(NEW, OLD); END; $body$;\'; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '      END IF;',                       '    END;',                       '  END LOOP;',                       '  -- 3. Xóa các kiểu dữ liệu tự định nghĩa (ENUM, Domain, Composite) trong public',                       '  FOR r IN (',                       '    SELECT t.typname FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid',                       '    LEFT JOIN pg_class c ON t.typrelid = c.oid',                       '    WHERE n.nspname = \'public\' AND (t.typtype IN (\'e\', \'d\') OR (t.typtype = \'c\' AND c.relkind = \'c\'))',                       '      AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = t.oid AND d.deptype = \'e\')',                       '  ) LOOP',                       '    BEGIN EXECUTE \'DROP TYPE IF EXISTS "public".\' \vert{}\vert{} quote_ident(r.typname) \vert{}\vert{} \' CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  END LOOP;',                       '  -- 4. Gỡ khóa ngoại Storage và làm sạch bảng auth.identities, auth.users cũ',                       '  BEGIN UPDATE storage.buckets SET owner = NULL WHERE owner IS NOT NULL; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  BEGIN UPDATE storage.objects SET owner = NULL WHERE owner IS NOT NULL; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  BEGIN DELETE FROM auth.identities; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  BEGIN DELETE FROM auth.users; EXCEPTION WHEN OTHERS THEN',                       '    FOR r IN (SELECT id FROM auth.users) LOOP BEGIN DELETE FROM auth.users WHERE id = r.id; EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP;',                       '  END;',                       'END $$;'
+                    ].join('\n') + '\n';
+                    fs.writeFileSync(f1PreClean, preCleanSql);
+
+                    // GIAI ĐOẠN 2: Xuất toàn bộ schema public (Không dùng --clean)
+                    await exec(`/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" ${commonFlags} > "${f3PublicFull}"`, execOptions);
+
+                    // GIAI ĐOẠN 3: Xuất dữ liệu tài khoản (auth.users trước, auth.identities sau)
+                    await exec(`/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --data-only --table=auth.users --column-inserts --on-conflict-do-nothing --no-owner --no-privileges --quote-all-identifiers > "${f2AuthData}"`, execOptions);
+                    await exec(`/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --data-only --table=auth.identities --column-inserts --on-conflict-do-nothing --no-owner --no-privileges --quote-all-identifiers >> "${f2AuthData}"`, execOptions);
+
+                    // GIAI ĐOẠN 4: Làm sạch Event Triggers, Comment hệ thống và chuẩn hóa CREATE OR REPLACE
+                    await exec(`perl -0777 -pi -e 's/CREATE EVENT TRIGGER.*?;//gs; s/ALTER EVENT TRIGGER.*?;//gs; s/DROP EVENT TRIGGER.*?;//gs; s/COMMENT ON EVENT TRIGGER.*?;//gs; s/COMMENT ON EXTENSION.*?;//gs; s/COMMENT ON SCHEMA "public".*?;//gs; s/^CREATE SCHEMA "public";/CREATE SCHEMA IF NOT EXISTS "public";/gm; s/^CREATE FUNCTION /CREATE OR REPLACE FUNCTION /gm; s/^CREATE PROCEDURE /CREATE OR REPLACE PROCEDURE /gm;' "${f3PublicFull}"`, execOptions);
+
+                    // GIAI ĐOẠN 5: Hợp nhất 3 giai đoạn theo đúng thứ tự: Dọn dẹp -> Nạp Auth -> Nạp Public
+                    await exec(`cat "${f1PreClean}" "${f2AuthData}" "${f3PublicFull}" > "${sqlFile}"`, execOptions);
+                    await exec(`gzip "${sqlFile}"`, execOptions);
+                    tempFiles.forEach(f => { if (fs.existsSync(f)) fs.unlinkSync(f); });
+
+                    return `  -> ✅ Thành công: ${sqlFile}.gz`;
+                  } catch (error) {
+                    tempFiles.forEach(f => { if (fs.existsSync(f)) fs.unlinkSync(f); });
+                    if (fs.existsSync(sqlFile)) fs.unlinkSync(sqlFile);
+                    if (fs.existsSync(`${sqlFile}.gz`)) fs.unlinkSync(`${sqlFile}.gz`);
+                    throw new Error(`  -> ❌ THẤT BẠI [${tenFileSafe}]: ${error.message.split('\n')[0]}`);
+                  }
+                });
+
+                const batchResults = await Promise.allSettled(batchPromises);
+
+                batchResults.forEach(res => {
+                  if (res.status === 'fulfilled') {
+                    console.log(res.value);
+                    successCount++;
+                  } else {
+                    console.error(res.reason.message);
+                    failCount++;
+                  }
+                });
+              }
+
+              console.log('\n--- TỔNG KẾT SAO LƯU ---');
+              console.log(`Thành công: ${successCount} | Thất bại: ${failCount} | Tổng số: ${results.length}`);
+
+            } catch (err) {
+              console.error('LỖI HỆ THỐNG TRẦM TRỌNG:', err.message);
+              process.exit(1);
+            }
+          }
+          main();
+          EOF
+          node backup_script.js
+
+      - name: Upload to Cloudflare R2 & Cleanup Old Backups
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          mkdir -p ~/.config/rclone
+          cat << EOF > ~/.config/rclone/rclone.conf
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $R2_ACCESS_KEY_ID
+          secret_access_key = $R2_SECRET_ACCESS_KEY
+          region = auto
+          endpoint = https://$CF_ACCOUNT_ID.r2.cloudflarestorage.com
+          EOF
+          
+          echo "🚀 Bắt đầu upload dữ liệu lên Cloudflare R2..."
+          rclone copy backups/ r2:$R2_BUCKET_NAME/database_backups/ --transfers=4 --checkers=8 -v
+          
+          echo "🧹 Đang quét dọn dẹp các file sao lưu cũ hơn 30 ngày..."
+          rclone delete r2:$R2_BUCKET_NAME/database_backups/ --min-age 30d -v
+          
+          rm ~/.config/rclone/rclone.conf
+          echo "✅ Đã hoàn tất sao lưu lên Cloudflare R2!"
