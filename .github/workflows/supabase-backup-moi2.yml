@@ -2,6 +2,7 @@ name: Sao lưu CSDL Supabase len Cloudflare R2 - chon truong moi2
 
 on:
   schedule:
+    # 05:00 UTC (12:00 trưa giờ VN) và 18:00 UTC (01:00 sáng giờ VN)
     - cron: '0 5,18 * * *'
   workflow_dispatch:
     inputs:
@@ -46,8 +47,9 @@ jobs:
           cat << 'EOF' > backup_script.js
           const fs = require('fs');
           const util = require('util');
+          // Tăng maxBuffer lên 50MB để tránh tràn bộ đệm khi xử lý file lớn
           const exec = util.promisify(require('child_process').exec);
-          const execOptions = { maxBuffer: 1024 * 1024 * 10 };
+          const execOptions = { maxBuffer: 1024 * 1024 * 50 };
 
           const cfAccountId = process.env.CF_ACCOUNT_ID;
           const cfApiToken = process.env.CF_API_TOKEN;
@@ -59,6 +61,7 @@ jobs:
             process.exit(1);
           }
 
+          // Loại trừ toàn bộ các schema hệ thống của Supabase
           const excludeSchemas = [
             'auth', 'storage', 'realtime', 'graphql', 'graphql_public',
             'extensions', 'pgbouncer', 'pgsodium', 'pgsodium_masks',
@@ -66,6 +69,8 @@ jobs:
             'net', '_realtime', '_analytics'
           ].map(s => `--exclude-schema=${s}`).join(' ');
 
+          // LƯU Ý QUAN TRỌNG: Không dùng --clean --if-exists ở đây vì Giai đoạn 1 (1_pre_clean.sql) đã xóa sạch bảng bằng CASCADE.
+          // Nhờ đó pg_dump sẽ KHÔNG sinh ra lệnh "DROP TRIGGER/POLICY ... ON public.xet_thidua" gây lỗi khi bảng chưa được tạo.
           const commonFlags = `--no-owner --no-privileges --no-publications --no-subscriptions --quote-all-identifiers ${excludeSchemas}`;
 
           async function main() {
@@ -89,11 +94,12 @@ jobs:
               });
 
               const d1Data = await d1Response.json();
-              if (!d1Data.success) throw new Error('Lỗi D1: ' + JSON.stringify(d1Data.errors));
+              if (!d1Data.success) throw new Error('Lỗi truy vấn D1: ' + JSON.stringify(d1Data.errors));
 
               const results = d1Data.result[0].results;
               if (!results || results.length === 0) {
-                console.log('❌ Không có dữ liệu.'); process.exit(0);
+                console.log(inputSlug ? `❌ Không tìm thấy trường nào có slug là "${inputSlug}".` : '❌ Không có dữ liệu trong bảng danh_sach_truong.');
+                process.exit(0);
               }
 
               console.log(`✅ Đã tìm thấy ${results.length} trường. Bắt đầu sao lưu...`);
@@ -115,7 +121,7 @@ jobs:
                   const absoluteIndex = i + indexInBatch;
                   const dbUrl = truong.supabase_sql;
                   const tenFileSafe = (truong.slug || `backup_truong_${absoluteIndex}`).replace(/[^a-zA-Z0-9_-]/g, '_');
-                  if (!dbUrl) throw new Error(`[${tenFileSafe}] Thiếu supabase_sql.`);
+                  if (!dbUrl) throw new Error(`[${tenFileSafe}] Thiếu chuỗi kết nối (supabase_sql).`);
 
                   const truongDir = `backups/${tenFileSafe}`;
                   if (!fs.existsSync(truongDir)) fs.mkdirSync(truongDir, { recursive: true });
@@ -127,29 +133,35 @@ jobs:
                   const tempFiles = [f1PreClean, f2AuthData, f3PublicFull];
 
                   try {
-                    // GIAI ĐOẠN 1: Tạo kịch bản dọn dẹp an toàn trước khi nạp dữ liệu
+                    // GIAI ĐOẠN 1: Tạo kịch bản dọn dẹp sạch 100% đối tượng cũ trong schema public
+                    // 1. Đưa mọi hàm Trigger trong public về trạng thái nghỉ (No-Op) trước tiên để không gọi vào các bảng sắp xóa
+                    // 2. Xóa sạch View, MatView, Table, Sequence, Custom Type (Enum/Composite) và Routine trong public kèm CASCADE
+                    // 3. Gỡ khóa ngoại storage và xóa sạch auth.identities, auth.users cũ
                     const preCleanSql = [
+                      'SET check_function_bodies = false;',
                       'DO $$ DECLARE r RECORD; BEGIN',
-                      '  FOR r IN (SELECT viewname FROM pg_views WHERE schemaname = \'public\') LOOP BEGIN EXECUTE \'DROP VIEW IF EXISTS "public".\' || quote_ident(r.viewname) || \' CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP;',
-                      '  FOR r IN (SELECT matviewname FROM pg_matviews WHERE schemaname = \'public\') LOOP BEGIN EXECUTE \'DROP MATERIALIZED VIEW IF EXISTS "public".\' || quote_ident(r.matviewname) || \' CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP;',
-                      '  FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = \'public\') LOOP BEGIN EXECUTE \'DROP TABLE IF EXISTS "public".\' || quote_ident(r.tablename) || \' CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP;',
-                      '  FOR r IN (SELECT sequencename FROM pg_sequences WHERE schemaname = \'public\') LOOP BEGIN EXECUTE \'DROP SEQUENCE IF EXISTS "public".\' || quote_ident(r.sequencename) || \' CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP;',
-                      '  FOR r IN (SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, p.prorettype FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = \'public\' AND p.prokind IN (\'f\', \'p\')) LOOP',
-                      '    BEGIN EXECUTE \'DROP ROUTINE IF EXISTS "public".\' || quote_ident(r.proname) || \'(\' || r.args || \');\'; EXCEPTION WHEN OTHERS THEN IF r.prorettype = \'pg_catalog.trigger\'::regtype THEN BEGIN EXECUTE \'CREATE OR REPLACE FUNCTION "public".\' || quote_ident(r.proname) || \'(\' || r.args || \') RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN RETURN COALESCE(NEW, OLD); END; $body$;\'; EXCEPTION WHEN OTHERS THEN NULL; END; END IF; END;',                       '  END LOOP;',                       '  BEGIN UPDATE storage.buckets SET owner = NULL WHERE owner IS NOT NULL; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  BEGIN UPDATE storage.objects SET owner = NULL WHERE owner IS NOT NULL; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  BEGIN DELETE FROM auth.identities; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  BEGIN DELETE FROM auth.users; EXCEPTION WHEN OTHERS THEN',                       '    FOR r IN (SELECT id FROM auth.users) LOOP BEGIN DELETE FROM auth.users WHERE id = r.id; EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP;',                       '  END;',                       'END $$;'
+                      '  -- 1. Vô hiệu hóa tạm thời mọi hàm Trigger trong public (đặc biệt các hàm đang gắn vào bảng auth.users)',
+                      '  FOR r IN (',
+                      '    SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS ident_args, pg_get_function_arguments(p.oid) AS full_args',
+                      '    FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid',
+                      '    WHERE n.nspname = \'public\' AND p.prorettype = \'pg_catalog.trigger\'::regtype',
+                      '  ) LOOP',
+                      '    BEGIN',
+                      '      EXECUTE \'CREATE OR REPLACE FUNCTION "public".\' || quote_ident(r.proname) || \'(\' || r.full_args || \') RETURNS trigger LANGUAGE plpgsql AS $body$ BEGIN RETURN COALESCE(NEW, OLD); END; $body$;\';',                       '    EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  END LOOP;',                       '  -- 2. Xóa sạch toàn bộ View, Materialized View, Bảng và Sequence trong public bằng CASCADE',                       '  FOR r IN (SELECT viewname FROM pg_views WHERE schemaname = \'public\') LOOP',                       '    BEGIN EXECUTE \'DROP VIEW IF EXISTS "public".\' \vert{}\vert{} quote_ident(r.viewname) \vert{}\vert{} \' CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  END LOOP;',                       '  FOR r IN (SELECT matviewname FROM pg_matviews WHERE schemaname = \'public\') LOOP',                       '    BEGIN EXECUTE \'DROP MATERIALIZED VIEW IF EXISTS "public".\' \vert{}\vert{} quote_ident(r.matviewname) \vert{}\vert{} \' CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  END LOOP;',                       '  FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = \'public\') LOOP',                       '    BEGIN EXECUTE \'DROP TABLE IF EXISTS "public".\' \vert{}\vert{} quote_ident(r.tablename) \vert{}\vert{} \' CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  END LOOP;',                       '  FOR r IN (SELECT sequencename FROM pg_sequences WHERE schemaname = \'public\') LOOP',                       '    BEGIN EXECUTE \'DROP SEQUENCE IF EXISTS "public".\' \vert{}\vert{} quote_ident(r.sequencename) \vert{}\vert{} \' CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  END LOOP;',                       '  -- 3. Xóa các hàm/thủ tục thường trong public (các hàm Trigger gắn với auth sẽ được giữ ở trạng thái nghỉ và ghi đè ở Giai đoạn 3)',                       '  FOR r IN (',                       '    SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args',                       '    FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid',                       '    WHERE n.nspname = \'public\' AND p.prokind IN (\'f\', \'p\') AND p.prorettype != \'pg_catalog.trigger\'::regtype',                       '  ) LOOP',                       '    BEGIN EXECUTE \'DROP ROUTINE IF EXISTS "public".\' \vert{}\vert{} quote_ident(r.proname) \vert{}\vert{} \'(\' \vert{}\vert{} r.args \vert{}\vert{} \') CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  END LOOP;',                       '  -- 4. Xóa các kiểu dữ liệu tự định nghĩa (ENUM, Composite, Domain) trong public để không bị lỗi "type already exists"',                       '  FOR r IN (',                       '    SELECT t.typname FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid',                       '    LEFT JOIN pg_class c ON t.typrelid = c.oid',                       '    WHERE n.nspname = \'public\' AND (t.typtype IN (\'e\', \'d\') OR (t.typtype = \'c\' AND c.relkind = \'c\'))',                       '  ) LOOP',                       '    BEGIN EXECUTE \'DROP TYPE IF EXISTS "public".\' \vert{}\vert{} quote_ident(r.typname) \vert{}\vert{} \' CASCADE;\'; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  END LOOP;',                       '  -- 5. Gỡ liên kết storage và làm sạch dữ liệu auth cũ',                       '  BEGIN UPDATE storage.buckets SET owner = NULL WHERE owner IS NOT NULL; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  BEGIN UPDATE storage.objects SET owner = NULL WHERE owner IS NOT NULL; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  BEGIN DELETE FROM auth.identities; EXCEPTION WHEN OTHERS THEN NULL; END;',                       '  BEGIN DELETE FROM auth.users; EXCEPTION WHEN OTHERS THEN',                       '    FOR r IN (SELECT id FROM auth.users) LOOP BEGIN DELETE FROM auth.users WHERE id = r.id; EXCEPTION WHEN OTHERS THEN NULL; END; END LOOP;',                       '  END;',                       'END $$;'
                     ].join('\n') + '\n';
                     fs.writeFileSync(f1PreClean, preCleanSql);
 
-                    // GIAI ĐOẠN 2: Xuất Public Schema
-                    await exec(`/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --clean --if-exists ${commonFlags} > "${f3PublicFull}"`, execOptions);
+                    // GIAI ĐOẠN 2: Xuất toàn bộ schema public (KHÔNG dùng --clean --if-exists để tránh lỗi DROP trên bảng đã xóa)
+                    await exec(`/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" ${commonFlags} > "${f3PublicFull}"`, execOptions);
 
-                    // GIAI ĐOẠN 3: Xuất Auth Data
+                    // GIAI ĐOẠN 3: Xuất dữ liệu tài khoản (auth.users trước, auth.identities sau)
                     await exec(`/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --data-only --table=auth.users --column-inserts --on-conflict-do-nothing --no-owner --no-privileges --quote-all-identifiers > "${f2AuthData}"`, execOptions);
                     await exec(`/usr/lib/postgresql/17/bin/pg_dump "${dbUrl}" --data-only --table=auth.identities --column-inserts --on-conflict-do-nothing --no-owner --no-privileges --quote-all-identifiers >> "${f2AuthData}"`, execOptions);
 
-                    // GIAI ĐOẠN 4: Làm sạch Event Triggers và chuẩn hóa DDL đa dòng
-                    await exec(`perl -0777 -pi -e 's/CREATE EVENT TRIGGER.*?;//gs; s/ALTER EVENT TRIGGER.*?;//gs; s/DROP EVENT TRIGGER.*?;//gs; s/COMMENT ON EVENT TRIGGER.*?;//gs; s/DROP FUNCTION IF EXISTS[^;]+;//gs; s/DROP PROCEDURE IF EXISTS[^;]+;//gs; s/DROP SCHEMA IF EXISTS "public"[^;]*;//gs; s/DROP SCHEMA "public"[^;]*;//gs; s/CREATE SCHEMA "public"/CREATE SCHEMA IF NOT EXISTS "public"/g; s/^CREATE FUNCTION /CREATE OR REPLACE FUNCTION /gm; s/^CREATE PROCEDURE /CREATE OR REPLACE PROCEDURE /gm;' "${f3PublicFull}"`, execOptions);
+                    // GIAI ĐOẠN 4: Làm sạch Event Triggers và chuyển CREATE FUNCTION/PROCEDURE/SCHEMA sang chế độ Idempotent (Ghi đè an toàn)
+                    await exec(`perl -0777 -pi -e 's/CREATE EVENT TRIGGER.*?;//gs; s/ALTER EVENT TRIGGER.*?;//gs; s/DROP EVENT TRIGGER.*?;//gs; s/COMMENT ON EVENT TRIGGER.*?;//gs; s/^CREATE SCHEMA "public";/CREATE SCHEMA IF NOT EXISTS "public";/gm; s/^CREATE FUNCTION /CREATE OR REPLACE FUNCTION /gm; s/^CREATE PROCEDURE /CREATE OR REPLACE PROCEDURE /gm;' "${f3PublicFull}"`, execOptions);
 
-                    // GIAI ĐOẠN 5: Hợp nhất và nén
+                    // GIAI ĐOẠN 5: Hợp nhất 3 giai đoạn và nén
                     await exec(`cat "${f1PreClean}" "${f2AuthData}" "${f3PublicFull}" > "${sqlFile}"`, execOptions);
                     await exec(`gzip "${sqlFile}"`, execOptions);
                     tempFiles.forEach(f => { if (fs.existsSync(f)) fs.unlinkSync(f); });
