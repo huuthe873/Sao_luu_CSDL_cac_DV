@@ -154,6 +154,7 @@ jobs:
                         --exclude-schema=pgsodium \
                         --exclude-schema=pgsodium_masks \
                         --exclude-schema=vault \
+                        --exclude-schema=cron \
                         > "${sqlFile}"`;
                     await exec(cmd, execOptions);
 
