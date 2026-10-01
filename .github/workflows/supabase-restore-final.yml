@@ -1,4 +1,4 @@
-name: Phục hồi CSDL Supabase - bản ổn định
+name: Phục hồi CSDL Supabase - bản ổn định 3
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       backup_file:
-        description: 'Tên file .sql.gz trên R2, hoặc nhập latest để dùng bản mới nhất'
+        description: 'Nhập latest, file .sql.gz, file .sql.gz.sha256, hoặc dán đường dẫn đầy đủ; workflow sẽ tự chuẩn hóa an toàn'
         required: true
         default: 'latest'
         type: string
@@ -106,7 +106,7 @@ jobs:
           const cfDbId = (process.env.CF_D1_DB_ID || '').trim();
           const r2Bucket = (process.env.R2_BUCKET_NAME || '').trim();
           const slug = (process.env.INPUT_SLUG || '').trim();
-          const fileReq = (process.env.INPUT_FILE || '').trim();
+          const rawFileReq = (process.env.INPUT_FILE || '').trim();
 
           function safeErrorMessage(err) {
             let msg = err && err.message ? String(err.message) : String(err);
@@ -119,9 +119,56 @@ jobs:
             return /^[A-Za-z0-9_-]+$/.test(value);
           }
 
-          function validateRequestedFile(value) {
-            if (value.toLowerCase() === 'latest') return true;
-            return /^[A-Za-z0-9._-]+\.sql\.gz$/.test(value) && !value.includes('..');
+          function isSafeBackupBasename(value) {
+            return /^[A-Za-z0-9._-]+\.sql\.gz$/i.test(value)
+              && !value.includes('..')
+              && !value.includes('/')
+              && !value.includes('\\');
+          }
+
+          function normalizeRequestedFile(value) {
+            let v = String(value || '').trim();
+
+            // Nếu workflow được gọi qua API/CLI mà bỏ trống input, dùng mặc định an toàn là latest.
+            if (!v) return 'latest';
+
+            // Chấp nhận người dùng nhập/dán kèm một cặp dấu nháy.
+            if ((v.startsWith('\"') && v.endsWith('\"')) || (v.startsWith("'") && v.endsWith("'"))) {
+              v = v.slice(1, -1).trim();
+            }
+            if (/^latest$/i.test(v)) return 'latest';
+
+            // Cho phép dán URL/path/object key từ R2 nhưng chỉ lấy basename; thư mục đích vẫn bị khóa theo slug.
+            // Loại query/hash nếu người dùng dán URL có tham số.
+            try {
+              if (/^https?:\/\//i.test(v)) {
+                const u = new URL(v);
+                v = decodeURIComponent(u.pathname || '');
+              } else {
+                v = v.split(/[?#]/, 1)[0];
+              }
+            } catch {
+              throw new Error('backup_file là URL không hợp lệ.');
+            }
+
+            v = v.replace(/\\/g, '/');
+            const parts = v.split('/').filter(Boolean);
+            let base = (parts.length ? parts[parts.length - 1] : v).trim();
+
+            // R2 lưu mỗi bản backup thành một cặp:
+            //   <ten>.sql.gz         = dữ liệu backup thực tế
+            //   <ten>.sql.gz.sha256  = checksum SHA-256 đi kèm
+            // Nếu người dùng chọn/dán nhầm file .sha256 trong giao diện R2,
+            // tự chuyển về file .sql.gz tương ứng thay vì báo lỗi.
+            if (/\.sql\.gz\.sha256$/i.test(base)) {
+              base = base.slice(0, -'.sha256'.length);
+              console.log(`ℹ️ Bạn đã chọn file checksum; tự chuyển sang backup tương ứng: ${base}`);
+            }
+
+            if (!isSafeBackupBasename(base)) {
+              throw new Error('backup_file không hợp lệ. Hãy nhập latest, file .sql.gz hoặc file .sql.gz.sha256.');
+            }
+            return base;
           }
 
           function connectionForPostgres(rawUrl) {
@@ -218,8 +265,9 @@ jobs:
               if (!slug || !validateSlug(slug)) {
                 throw new Error('truong_slug không hợp lệ. Chỉ cho phép A-Z, a-z, 0-9, _ và -.');
               }
-              if (!fileReq || !validateRequestedFile(fileReq)) {
-                throw new Error('backup_file không hợp lệ. Chỉ nhập latest hoặc đúng một tên file .sql.gz, không chứa đường dẫn.');
+              const fileReq = normalizeRequestedFile(rawFileReq);
+              if (rawFileReq && rawFileReq !== fileReq) {
+                console.log(`ℹ️ backup_file đã được chuẩn hóa thành: ${fileReq}`);
               }
 
               console.log(`--- Truy vấn D1 cho trường [${slug}] ---`);
@@ -288,7 +336,7 @@ jobs:
               }
 
               const selectedName = selected.Path;
-              if (selectedName.includes('/') || selectedName.includes('\\') || !validateRequestedFile(selectedName)) {
+              if (selectedName.includes('/') || selectedName.includes('\\') || !isSafeBackupBasename(selectedName)) {
                 throw new Error('Tên file trên R2 không hợp lệ; dừng để tránh path traversal.');
               }
 
