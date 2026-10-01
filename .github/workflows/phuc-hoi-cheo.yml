@@ -1,4 +1,4 @@
-name: Phục hồi CSDL Supabase - hỗ trợ phục hồi chéo trường
+name: Phục hồi CSDL Supabase - chéo trường + chống deadlock
 
 on:
   workflow_dispatch:
@@ -514,19 +514,75 @@ jobs:
 
               console.log('🔥 Bắt đầu restore trong MỘT transaction PostgreSQL với ON_ERROR_STOP=1...');
 
-              try {
-                await run(PSQL, [
-                  `--dbname=${conn.safeUrl}`,
-                  '-X',
-                  '--no-psqlrc',
-                  '-v', 'ON_ERROR_STOP=1',
-                  '--single-transaction',
-                  '--file', sqlFile
-                ], { env: conn.env });
-              } catch (dbErr) {
+              // Khóa trước các bảng chính trong cùng transaction restore để tránh deadlock khi ứng dụng
+              // vẫn còn request đồng thời. Nếu chưa lấy được lock trong cửa sổ ngắn, transaction sẽ rollback
+              // và workflow tự thử lại từ đầu. Không terminate session Supabase/người dùng một cách cưỡng bức.
+              const lockPrelude = String.raw`
+                SET lock_timeout = '15s';
+                SET statement_timeout = '0';
+                DO $restore_lock$
+                DECLARE r RECORD;
+                BEGIN
+                  IF to_regclass('auth.users') IS NOT NULL THEN
+                    LOCK TABLE auth.users IN ACCESS EXCLUSIVE MODE;
+                  END IF;
+                  IF to_regclass('auth.identities') IS NOT NULL THEN
+                    LOCK TABLE auth.identities IN ACCESS EXCLUSIVE MODE;
+                  END IF;
+
+                  FOR r IN
+                    SELECT n.nspname, c.relname
+                    FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = 'public'
+                      AND c.relkind IN ('r', 'p', 'm')
+                    ORDER BY c.relname, c.oid
+                  LOOP
+                    EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE', r.nspname, r.relname);
+                  END LOOP;
+                END
+                $restore_lock$;
+                SET lock_timeout = '0';
+              `;
+
+              const maxRestoreAttempts = 5;
+              const retryDelaysMs = [2000, 5000, 10000, 15000];
+              let restored = false;
+              let lastRestoreError = null;
+
+              for (let attempt = 1; attempt <= maxRestoreAttempts; attempt++) {
+                try {
+                  console.log(`🔒 Restore attempt ${attempt}/${maxRestoreAttempts}: đang lấy khóa độc quyền ngắn hạn trên auth/public...`);
+                  await run(PSQL, [
+                    `--dbname=${conn.safeUrl}`,
+                    '-X',
+                    '--no-psqlrc',
+                    '-v', 'ON_ERROR_STOP=1',
+                    '--single-transaction',
+                    '-c', lockPrelude,
+                    '--file', sqlFile
+                  ], { env: conn.env });
+                  restored = true;
+                  break;
+                } catch (dbErr) {
+                  lastRestoreError = dbErr;
+                  const msg = safeErrorMessage(dbErr);
+                  const retryable = /deadlock detected|lock timeout|canceling statement due to lock timeout|could not obtain lock/i.test(msg);
+
+                  if (!retryable || attempt >= maxRestoreAttempts) {
+                    break;
+                  }
+
+                  const delay = retryDelaysMs[Math.min(attempt - 1, retryDelaysMs.length - 1)];
+                  console.warn(`⚠️ Restore gặp tranh chấp khóa/deadlock ở lần ${attempt}; transaction đã rollback. Sẽ thử lại sau ${Math.round(delay / 1000)} giây.`);
+                  await new Promise(resolve => setTimeout(resolve, delay));
+                }
+              }
+
+              if (!restored) {
                 throw new Error(
-                  'RESTORE THẤT BẠI. psql đã dừng khi gặp lỗi; transaction restore đã bị PostgreSQL rollback.\n' +
-                  safeErrorMessage(dbErr)
+                  'RESTORE THẤT BẠI. PostgreSQL đã rollback transaction restore. Nếu lỗi là deadlock/lock timeout sau nhiều lần thử, hãy tạm dừng lưu lượng ứng dụng trong thời gian restore.\n' +
+                  safeErrorMessage(lastRestoreError)
                 );
               }
 
