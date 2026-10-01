@@ -111,7 +111,7 @@ jobs:
           const { createGunzip } = require('zlib');
 
           const PSQL = '/usr/lib/postgresql/17/bin/psql';
-          const SUPPORTED_BACKUP_VERSIONS = new Set(['4']);
+          const SUPPORTED_BACKUP_VERSIONS = new Set(['4', '5']);
 
           const cfAccountId = (process.env.CF_ACCOUNT_ID || '').trim();
           const cfApiToken = (process.env.CF_API_TOKEN || '').trim();
@@ -234,6 +234,70 @@ jobs:
             const hash = crypto.createHash('sha256');
             await pipeline(fs.createReadStream(filePath), hash);
             return hash.digest('hex');
+          }
+
+          async function patchKnownLegacySequenceDropBug(filePath) {
+            // Một số backup format v4 cũ tạo pre-clean với Table/Sequence trong cùng một vòng lặp.
+            // pg_class không bảo đảm thứ tự, nên sequence OWNED BY có thể bị DROP trước bảng và PostgreSQL
+            // báo: "cannot drop sequence ... because column ... requires it".
+            // Chỉ vá đúng câu lệnh trong khối pre-clean; tuyệt đối không sửa các DROP SEQUENCE do pg_dump sinh ra.
+            const input = fs.createReadStream(filePath, { encoding: 'utf8' });
+            const tempPath = `${filePath}.patched`;
+            const output = fs.createWriteStream(tempPath, { encoding: 'utf8' });
+            const rl = require('readline').createInterface({ input, crlfDelay: Infinity });
+
+            let inPreclean = false;
+            let patched = 0;
+            const needle = `EXECUTE 'DROP SEQUENCE IF EXISTS "public".' || quote_ident(r.relname) || ' CASCADE;';`;
+
+            try {
+              for await (let line of rl) {
+                if (/^\s*DO\s+\$(?:restore_preclean)?\$/.test(line) || /^\s*DO\s+\$\$/.test(line)) {
+                  inPreclean = true;
+                }
+
+                if (inPreclean && line.trim() === needle) {
+                  const indent = line.match(/^\s*/)?.[0] || '';
+                  const replacement = [
+                    `${indent}BEGIN`,
+                    `${indent}  ${needle}`,
+                    `${indent}EXCEPTION`,
+                    `${indent}  WHEN dependent_objects_still_exist THEN NULL;`,
+                    `${indent}END;`
+                  ].join('\n');
+                  if (!output.write(replacement + '\n')) {
+                    await new Promise(resolve => output.once('drain', resolve));
+                  }
+                  patched++;
+                } else {
+                  if (!output.write(line + '\n')) {
+                    await new Promise(resolve => output.once('drain', resolve));
+                  }
+                }
+
+                if (inPreclean && (
+                  /^\s*\$restore_preclean\$;\s*$/.test(line) ||
+                  /^\s*END\s+\$\$;\s*$/.test(line) ||
+                  /^\s*\$\$;\s*$/.test(line)
+                )) {
+                  inPreclean = false;
+                }
+              }
+
+              await new Promise((resolve, reject) => {
+                output.end(resolve);
+                output.on('error', reject);
+              });
+              fs.renameSync(tempPath, filePath);
+              if (patched > 0) {
+                console.warn(`⚠️ Đã vá ${patched} lệnh DROP SEQUENCE trong pre-clean legacy để sequence OWNED BY được xử lý an toàn.`);
+              }
+              return patched;
+            } catch (err) {
+              try { output.destroy(); } catch {}
+              try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+              throw err;
+            }
           }
 
           async function scanSqlForForbiddenContent(filePath) {
@@ -402,6 +466,8 @@ jobs:
                 throw new Error('File SQL sau giải nén quá nhỏ/bất thường.');
               }
 
+              // Vá có mục tiêu cho bug thứ tự DROP SEQUENCE của một số backup v4 cũ trước khi quét và restore.
+              await patchKnownLegacySequenceDropBug(sqlFile);
               await scanSqlForForbiddenContent(sqlFile);
 
               const fd = fs.openSync(sqlFile, 'r');
