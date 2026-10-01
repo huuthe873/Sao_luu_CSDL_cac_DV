@@ -636,6 +636,7 @@ jobs:
           secret_access_key = $R2_SECRET_ACCESS_KEY
           region = auto
           endpoint = https://$CF_ACCOUNT_ID.r2.cloudflarestorage.com
+          no_check_bucket = true
           EOF
           chmod 600 ~/.config/rclone/rclone.conf
 
@@ -650,6 +651,7 @@ jobs:
 
           const fs = require('fs');
           const path = require('path');
+          const crypto = require('crypto');
           const { spawn } = require('child_process');
 
           const bucket = (process.env.R2_BUCKET_NAME || '').trim();
@@ -668,18 +670,50 @@ jobs:
               child.on('error', reject);
               child.on('close', code => {
                 if (code === 0 || allowFailure) return resolve({ code, stdout, stderr });
-                reject(new Error(`${path.basename(command)} thất bại (exit ${code}): ${stderr.trim().split('\n').slice(-8).join('\n')}`));
+                const tail = stderr.trim().split('\n').slice(-12).join('\n');
+                reject(new Error(`${path.basename(command)} failed (exit ${code})${tail ? `: ${tail}` : ''}`));
               });
             });
           }
 
+          function sha256(filePath) {
+            return new Promise((resolve, reject) => {
+              const hash = crypto.createHash('sha256');
+              const stream = fs.createReadStream(filePath);
+              stream.on('error', reject);
+              stream.on('data', chunk => hash.update(chunk));
+              stream.on('end', () => resolve(hash.digest('hex')));
+            });
+          }
+
           async function remoteDelete(remotePath) {
-            await run('rclone', ['deletefile', remotePath], { allowFailure: true });
+            await run('rclone', ['deletefile', remotePath, '--s3-no-check-bucket'], { allowFailure: true });
+          }
+
+          async function verifyRemoteFile(remoteGz, expectedSha, slug) {
+            const verifyDir = path.join('.r2_verify', slug);
+            fs.mkdirSync(verifyDir, { recursive: true });
+            const localVerify = path.join(verifyDir, path.basename(remoteGz));
+            try {
+              await run('rclone', [
+                'copyto', remoteGz, localVerify,
+                '--s3-no-check-bucket',
+                '--retries', '3',
+                '--low-level-retries', '10'
+              ]);
+              const actualSha = await sha256(localVerify);
+              if (actualSha !== expectedSha) {
+                throw new Error(`remote SHA-256 mismatch: expected ${expectedSha}, got ${actualSha}`);
+              }
+            } finally {
+              try { if (fs.existsSync(localVerify)) fs.unlinkSync(localVerify); } catch {}
+              try { fs.rmSync(verifyDir, { recursive: true, force: true }); } catch {}
+            }
           }
 
           async function cleanupSlug(slug) {
             const remoteDir = `r2:${bucket}/database_backups/${slug}/`;
-            const result = await run('rclone', ['lsjson', remoteDir, '--files-only']);
+            const result = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket']);
             const all = JSON.parse(result.stdout || '[]');
             const gzFiles = all
               .filter(x => typeof x.Path === 'string' && x.Path.endsWith('.sql.gz'))
@@ -693,12 +727,10 @@ jobs:
               if (protectedNames.has(file.Path)) continue;
               const modTime = new Date(file.ModTime).getTime();
               if (!Number.isFinite(modTime) || modTime >= cutoff) continue;
-
               await remoteDelete(`${remoteDir}${file.Path}`);
               await remoteDelete(`${remoteDir}${file.Path}.sha256`);
               deleted++;
             }
-
             return deleted;
           }
 
@@ -706,13 +738,13 @@ jobs:
             const uploadStatus = { uploaded: [], failures: [], cleanupFailures: [] };
 
             if (!bucket) {
-              uploadStatus.failures.push({ slug: '*', error: 'Thiếu R2_BUCKET_NAME.' });
+              uploadStatus.failures.push({ slug: '*', error: 'Missing R2_BUCKET_NAME.' });
               fs.writeFileSync(UPLOAD_STATUS, JSON.stringify(uploadStatus, null, 2) + '\n');
               return;
             }
 
             if (!fs.existsSync(BACKUP_STATUS)) {
-              uploadStatus.failures.push({ slug: '*', error: 'Không tìm thấy backup_status.json; không upload gì để tránh đẩy dữ liệu không xác định.' });
+              uploadStatus.failures.push({ slug: '*', error: 'backup_status.json not found.' });
               fs.writeFileSync(UPLOAD_STATUS, JSON.stringify(uploadStatus, null, 2) + '\n');
               return;
             }
@@ -728,33 +760,49 @@ jobs:
 
               try {
                 if (!fs.existsSync(item.gzipFile) || !fs.existsSync(item.checksumFile)) {
-                  throw new Error('Thiếu file .sql.gz hoặc .sha256 cục bộ.');
+                  throw new Error('Missing local .sql.gz or .sha256 file.');
+                }
+                if (!/^[a-f0-9]{64}$/i.test(String(item.sha256 || ''))) {
+                  throw new Error('Invalid local SHA-256 metadata.');
                 }
 
-                console.log(`⬆️ [${slug}] Upload ${path.basename(item.gzipFile)}...`);
-                await run('rclone', ['copyto', item.gzipFile, remoteGz, '--checksum', '--retries', '3', '--low-level-retries', '10']);
-                await run('rclone', ['copyto', item.checksumFile, remoteSha, '--checksum', '--retries', '3', '--low-level-retries', '10']);
+                console.log(`[${slug}] Uploading ${path.basename(item.gzipFile)} to R2...`);
 
-                uploadStatus.uploaded.push({ slug, fileName: path.basename(item.gzipFile) });
-                console.log(`✅ [${slug}] Upload thành công.`);
+                await run('rclone', [
+                  'copyto', item.gzipFile, remoteGz,
+                  '--s3-no-check-bucket',
+                  '--retries', '3',
+                  '--low-level-retries', '10'
+                ]);
+
+                await verifyRemoteFile(remoteGz, item.sha256, slug);
+
+                await run('rclone', [
+                  'copyto', item.checksumFile, remoteSha,
+                  '--s3-no-check-bucket',
+                  '--retries', '3',
+                  '--low-level-retries', '10'
+                ]);
+
+                uploadStatus.uploaded.push({ slug, fileName: path.basename(item.gzipFile), sha256: item.sha256 });
+                console.log(`[${slug}] R2 upload and SHA-256 verification succeeded.`);
               } catch (err) {
-                // Nếu upload dở dang, xóa cặp remote để tránh "latest" chọn nhầm một backup không hoàn chỉnh.
                 await remoteDelete(remoteGz);
                 await remoteDelete(remoteSha);
-                uploadStatus.failures.push({ slug, error: String(err.message || err) });
-                console.error(`❌ [${slug}] Upload thất bại: ${err.message || err}`);
+                const message = String(err.message || err);
+                uploadStatus.failures.push({ slug, error: message });
+                console.error(`UPLOAD FAILURE [${slug}]: ${message}`);
               }
             }
 
-            // Chỉ cleanup trường đã upload thành công ở lần chạy hiện tại.
-            // Nếu trường đang backup lỗi, bản tốt cũ của trường đó sẽ KHÔNG bị cleanup.
             for (const item of uploadStatus.uploaded) {
               try {
                 const deleted = await cleanupSlug(item.slug);
-                console.log(`🧹 [${item.slug}] Đã xóa ${deleted} backup quá 30 ngày; luôn giữ tối thiểu ${KEEP_MINIMUM} bản mới nhất.`);
+                console.log(`[${item.slug}] Cleanup deleted ${deleted} expired backup(s); newest ${KEEP_MINIMUM} are protected.`);
               } catch (err) {
-                uploadStatus.cleanupFailures.push({ slug: item.slug, error: String(err.message || err) });
-                console.error(`⚠️ [${item.slug}] Cleanup thất bại: ${err.message || err}`);
+                const message = String(err.message || err);
+                uploadStatus.cleanupFailures.push({ slug: item.slug, error: message });
+                console.error(`CLEANUP FAILURE [${item.slug}]: ${message}`);
               }
             }
 
@@ -762,8 +810,9 @@ jobs:
           }
 
           main().catch(err => {
-            fs.writeFileSync(UPLOAD_STATUS, JSON.stringify({ uploaded: [], failures: [{ slug: '*', error: String(err.message || err) }], cleanupFailures: [] }, null, 2) + '\n');
-            console.error(err);
+            const message = String(err.message || err);
+            fs.writeFileSync(UPLOAD_STATUS, JSON.stringify({ uploaded: [], failures: [{ slug: '*', error: message }], cleanupFailures: [] }, null, 2) + '\n');
+            console.error(`UPLOAD SCRIPT FATAL: ${message}`);
           });
           NODE
 
@@ -796,6 +845,8 @@ jobs:
           const upload = JSON.parse(fs.readFileSync('upload_status.json', 'utf8'));
           const uploadFailures = Array.isArray(upload.failures) ? upload.failures : [];
           const cleanupFailures = Array.isArray(upload.cleanupFailures) ? upload.cleanupFailures : [];
+          for (const item of uploadFailures) console.error(`UPLOAD FAILURE DETAIL [${item.slug}]: ${item.error}`);
+          for (const item of cleanupFailures) console.error(`CLEANUP FAILURE DETAIL [${item.slug}]: ${item.error}`);
           if (uploadFailures.length > 0 || cleanupFailures.length > 0) {
             failed = true;
             console.error(`❌ R2 có lỗi. Upload lỗi: ${uploadFailures.length}, cleanup lỗi: ${cleanupFailures.length}.`);
