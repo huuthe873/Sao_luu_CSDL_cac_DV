@@ -1,4 +1,4 @@
-name: Khoi_phuc_moi_nhat
+name: Khoi_phuc_moi_nhat_02.10
 
 on:
   workflow_dispatch:
@@ -21,19 +21,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: supabase-db-restore-direct-${{ github.repository }}
+  group: supabase-db-maintenance-${{ github.repository }}
   cancel-in-progress: false
 
 env:
   BACKUP_FORMAT: supabase-cli-r2-v1
   BACKUP_PREFIX: database_backups
-  SAFETY_PREFIX: database_backups_safety
   SUPABASE_CLI_VERSION: '2.117.0'
 
 jobs:
   restore:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -107,10 +106,12 @@ jobs:
           INPUT_BACKUP_FILE: ${{ github.event.inputs.backup_file }}
         run: |
           set -euo pipefail
-          cat > restore_direct_v9.js <<'NODE'
+          cat > restore_direct_v14.js <<'NODE'
           const fs = require('fs');
           const path = require('path');
           const crypto = require('crypto');
+          const readline = require('readline');
+          const { once } = require('events');
           const { spawn } = require('child_process');
 
           const cfAccountId = process.env.CF_ACCOUNT_ID || '';
@@ -118,7 +119,6 @@ jobs:
           const cfDbId = process.env.CF_D1_DB_ID || '';
           const bucket = process.env.R2_BUCKET_NAME || '';
           const prefix = process.env.BACKUP_PREFIX || 'database_backups';
-          const safetyPrefix = process.env.SAFETY_PREFIX || 'database_backups_safety';
           const expectedFormat = process.env.BACKUP_FORMAT || 'supabase-cli-r2-v1';
           const suffix = (process.env.INPUT_SUFFIX || '').trim();
           const requestedFile = (process.env.INPUT_BACKUP_FILE || '').trim();
@@ -184,11 +184,17 @@ jobs:
                 maintenanceRouteLogged = true;
               }
             }
+            if (!u.searchParams.has('sslmode')) u.searchParams.set('sslmode', 'require');
+            if (!u.searchParams.has('connect_timeout')) u.searchParams.set('connect_timeout', '30');
+            if (!u.searchParams.has('keepalives')) u.searchParams.set('keepalives', '1');
+            if (!u.searchParams.has('keepalives_idle')) u.searchParams.set('keepalives_idle', '30');
+            if (!u.searchParams.has('keepalives_interval')) u.searchParams.set('keepalives_interval', '10');
+            if (!u.searchParams.has('keepalives_count')) u.searchParams.set('keepalives_count', '5');
             return u.toString();
           }
 
           function isTransientPgConnectionError(text) {
-            return /(SSL error:\s*unexpected eof|server closed the connection unexpectedly|connection reset by peer|broken pipe|connection timed out|timeout expired|could not receive data from server|could not send data to server|terminating connection due to administrator command|the database system is starting up|cannot connect now|network is unreachable|no route to host|temporary failure in name resolution)/i.test(String(text || ''));
+            return /(SSL error:\s*unexpected eof|server closed the connection unexpectedly|connection reset by peer|broken pipe|connection timed out|timeout expired|could not receive data from server|could not send data to server|terminating connection due to administrator command|the database system is starting up|cannot connect now|network is unreachable|no route to host|temporary failure in name resolution|i\/o timeout|TLS handshake timeout)/i.test(String(text || ''));
           }
 
           async function d1Query(sql, params = []) {
@@ -252,6 +258,29 @@ jobs:
             throw lastErr;
           }
 
+          async function dumpWithRetry(dbUrl, outputFile, extraArgs, label) {
+            const maintenanceUrl = maintenanceDbUrl(dbUrl);
+            let lastErr;
+            for (let attempt = 1; attempt <= 4; attempt++) {
+              fs.rmSync(outputFile, { force: true });
+              try {
+                const result = await run('supabase', ['db', 'dump', '--db-url', maintenanceUrl, '-f', outputFile, ...extraArgs], { echoStdout: true, echoStderr: false });
+                if (result.stderr && result.stderr.trim()) console.warn(`${label} diagnostic: ${safeError({ stderr: result.stderr })}`);
+                if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size === 0) throw new Error(`${label} produced an empty dump file.`);
+                return;
+              } catch (err) {
+                lastErr = err;
+                fs.rmSync(outputFile, { force: true });
+                const msg = safeError(err);
+                if (!isTransientPgConnectionError(msg) || attempt === 4) throw err;
+                const wait = [5, 10, 20][attempt - 1] || 20;
+                console.warn(`Transient connection error during ${label} (attempt ${attempt}/4). Retrying in ${wait}s.`);
+                await sleep(wait * 1000);
+              }
+            }
+            throw lastErr;
+          }
+
           async function relationExists(dbUrl, regclass) {
             const escaped = regclass.replace(/'/g, "''");
             return (await psql(dbUrl, `SELECT CASE WHEN to_regclass('${escaped}') IS NULL THEN '0' ELSE '1' END;`)) === '1';
@@ -288,15 +317,20 @@ jobs:
             return ['public', raw.replace(/^"|"$/g, '')];
           }
 
-          function parseCopyTableNames(dataFile) {
-            const lines = fs.readFileSync(dataFile, 'utf8').split(/\r?\n/);
+          async function parseCopyTableNames(dataFile) {
+            const input = fs.createReadStream(dataFile, { encoding: 'utf8', highWaterMark: 1024 * 1024 });
+            const rl = readline.createInterface({ input, crlfDelay: Infinity });
             const names = [];
-            for (const line of lines) {
-              const m = line.match(/^COPY\s+(.+?)\s+\(.+\)\s+FROM stdin;$/);
-              if (!m) continue;
-              const [schema, table] = parseQualifiedName(m[1]);
-              if (!schema || !table) throw new Error(`Invalid COPY target: ${m[1]}`);
-              names.push(`${schema}.${table}`);
+            try {
+              for await (const line of rl) {
+                const m = line.match(/^COPY\s+(.+?)\s+\(.+\)\s+FROM stdin;$/);
+                if (!m) continue;
+                const [schema, table] = parseQualifiedName(m[1]);
+                if (!schema || !table) throw new Error(`Invalid COPY target: ${m[1]}`);
+                names.push(`${schema}.${table}`);
+              }
+            } finally {
+              rl.close();
             }
             return [...new Set(names)].sort();
           }
@@ -326,19 +360,24 @@ jobs:
             return v;
           }
 
-          function parseCopyLayouts(dataFile) {
-            const lines = fs.readFileSync(dataFile, 'utf8').split(/\r?\n/);
+          async function parseCopyLayouts(dataFile) {
+            const input = fs.createReadStream(dataFile, { encoding: 'utf8', highWaterMark: 1024 * 1024 });
+            const rl = readline.createInterface({ input, crlfDelay: Infinity });
             const layouts = new Map();
-            for (const line of lines) {
-              const m = line.match(/^COPY\s+(.+?)\s+\((.*)\)\s+FROM stdin;$/);
-              if (!m) continue;
-              const [schema, table] = parseQualifiedName(m[1]);
-              if (!schema || !table) throw new Error(`Invalid COPY target: ${m[1]}`);
-              const cols = splitSqlIdentifierList(m[2]).map(unquoteIdentifier);
-              const key = `${schema}.${table}`;
-              const old = layouts.get(key);
-              if (old && JSON.stringify(old) !== JSON.stringify(cols)) throw new Error(`Backup contains inconsistent COPY layouts for ${key}.`);
-              layouts.set(key, cols);
+            try {
+              for await (const line of rl) {
+                const m = line.match(/^COPY\s+(.+?)\s+\((.*)\)\s+FROM stdin;$/);
+                if (!m) continue;
+                const [schema, table] = parseQualifiedName(m[1]);
+                if (!schema || !table) throw new Error(`Invalid COPY target: ${m[1]}`);
+                const cols = splitSqlIdentifierList(m[2]).map(unquoteIdentifier);
+                const key = `${schema}.${table}`;
+                const old = layouts.get(key);
+                if (old && JSON.stringify(old) !== JSON.stringify(cols)) throw new Error(`Backup contains inconsistent COPY layouts for ${key}.`);
+                layouts.set(key, cols);
+              }
+            } finally {
+              rl.close();
             }
             return layouts;
           }
@@ -367,7 +406,7 @@ jobs:
             const merged = new Map();
             for (const file of files.filter(Boolean)) {
               if (!fs.existsSync(file)) continue;
-              for (const [key, cols] of parseCopyLayouts(file)) {
+              for (const [key, cols] of await parseCopyLayouts(file)) {
                 const old = merged.get(key);
                 if (old && JSON.stringify(old) !== JSON.stringify(cols)) throw new Error(`Backup has conflicting COPY column layouts for ${key}.`);
                 merged.set(key, cols);
@@ -396,20 +435,24 @@ jobs:
             return { layouts: merged, errors, warnings };
           }
 
-          function parseCopyCounts(dataFile) {
-            const text = fs.readFileSync(dataFile, 'utf8');
-            const lines = text.split(/\r?\n/);
+          async function parseCopyCounts(dataFile) {
+            const input = fs.createReadStream(dataFile, { encoding: 'utf8', highWaterMark: 1024 * 1024 });
+            const rl = readline.createInterface({ input, crlfDelay: Infinity });
             const counts = {};
             let current = null, count = 0;
-            for (const line of lines) {
-              if (!current) {
-                const m = line.match(/^COPY\s+(.+?)\s+\(.+\)\s+FROM stdin;$/);
-                if (m) { current = m[1]; count = 0; }
-              } else if (line === '\\.') {
-                const [schema, table] = parseQualifiedName(current);
-                counts[`${schema}.${table}`] = count;
-                current = null; count = 0;
-              } else count++;
+            try {
+              for await (const line of rl) {
+                if (!current) {
+                  const m = line.match(/^COPY\s+(.+?)\s+\(.+\)\s+FROM stdin;$/);
+                  if (m) { current = m[1]; count = 0; }
+                } else if (line === '\\.') {
+                  const [schema, table] = parseQualifiedName(current);
+                  counts[`${schema}.${table}`] = count;
+                  current = null; count = 0;
+                } else count++;
+              }
+            } finally {
+              rl.close();
             }
             if (current) throw new Error('data.sql ended inside a COPY block.');
             return Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
@@ -500,9 +543,49 @@ jobs:
 
           async function listRemoteDir(remoteDir) {
             try {
-              const { stdout } = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket'], { echoStderr: false });
+              const { stdout } = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket', '--retries', '5', '--low-level-retries', '10', '--contimeout', '30s', '--timeout', '10m'], { echoStderr: false });
               return JSON.parse(stdout || '[]');
-            } catch (_) { return []; }
+            } catch (e) {
+              const msg = String(e && (e.stderr || e.message || e) || '');
+              if (/directory not found|object not found|not found|404/i.test(msg)) return [];
+              throw e;
+            }
+          }
+
+          function validVietnamStampToEpoch(stamp) {
+            const m = String(stamp || '').match(/^(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{4})$/);
+            if (!m) return null;
+            const [, hh, mm, ss, dd, mo, yyyy] = m.map((x, i) => i === 0 ? x : Number(x));
+            if (hh > 23 || mm > 59 || ss > 59 || mo < 1 || mo > 12 || dd < 1 || dd > 31) return null;
+            const epochMs = Date.UTC(yyyy, mo - 1, dd, hh - 7, mm, ss);
+            const check = new Date(epochMs + 7 * 3600 * 1000);
+            if (check.getUTCFullYear() !== yyyy || check.getUTCMonth() + 1 !== mo || check.getUTCDate() !== dd ||
+                check.getUTCHours() !== hh || check.getUTCMinutes() !== mm || check.getUTCSeconds() !== ss) return null;
+            return epochMs;
+          }
+
+          function snapshotTimeForName(name) {
+            const escSlug = suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+            // Current short family, Vietnam local time (UTC+7):
+            // <slug>_<HH-MM-SS>_<DD-MM-YYYY>.tar.gz
+            let m = String(name || '').match(new RegExp(`^${escSlug}_(\\d{2}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{4})\\.tar\\.gz$`));
+            if (m) {
+              const epochMs = validVietnamStampToEpoch(m[1]);
+              if (epochMs !== null) return epochMs;
+            }
+
+            // Backward compatibility with v7-and-earlier CLI backups already stored in R2.
+            const escFormat = expectedFormat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            m = String(name || '').match(new RegExp(`^${escSlug}_(\\d{8})T(\\d{2})(\\d{2})(\\d{2})Z_${escFormat}\\.tar\\.gz$`));
+            if (!m) return null;
+            const y = Number(m[1].slice(0, 4)), mo = Number(m[1].slice(4, 6)), d = Number(m[1].slice(6, 8));
+            const hh = Number(m[2]), mm = Number(m[3]), ss = Number(m[4]);
+            const epochMs = Date.UTC(y, mo - 1, d, hh, mm, ss);
+            const check = new Date(epochMs);
+            if (check.getUTCFullYear() !== y || check.getUTCMonth() + 1 !== mo || check.getUTCDate() !== d ||
+                check.getUTCHours() !== hh || check.getUTCMinutes() !== mm || check.getUTCSeconds() !== ss) return null;
+            return epochMs;
           }
 
           async function resolveBackupLocation() {
@@ -512,11 +595,13 @@ jobs:
             const map = new Map(files.map(f => [f.Path, f]));
             if (wanted === 'latest') {
               const complete = files
-                .filter(f => f.Path.endsWith('.tar.gz'))
-                .filter(f => map.has(`${f.Path}.sha256`) && map.has(`${f.Path}.manifest.json`))
-                .sort((a, b) => new Date(b.ModTime) - new Date(a.ModTime));
+                .map(f => ({ file: f, epochMs: snapshotTimeForName(f.Path) }))
+                .filter(x => Number.isFinite(x.epochMs))
+                .filter(x => map.has(`${x.file.Path}.sha256`) && map.has(`${x.file.Path}.manifest.json`))
+                // Parsed snapshot time is authoritative; R2 ModTime can change after a re-upload.
+                .sort((a, b) => b.epochMs - a.epochMs || String(b.file.Path).localeCompare(String(a.file.Path)));
               if (!complete.length) throw new Error(`No complete Supabase CLI backup set found for suffix [${suffix}].`);
-              return { remoteDir: defaultDir, name: complete[0].Path };
+              return { remoteDir: defaultDir, name: complete[0].file.Path };
             }
             if (map.has(wanted) && map.has(`${wanted}.sha256`) && map.has(`${wanted}.manifest.json`)) {
               return { remoteDir: defaultDir, name: wanted };
@@ -544,9 +629,10 @@ jobs:
             const localBundle = path.join('restore_work', loc.name);
             const localSha = `${localBundle}.sha256`;
             const localManifest = `${localBundle}.manifest.json`;
-            await run('rclone', ['copyto', `${loc.remoteDir}/${loc.name}`, localBundle, '--s3-no-check-bucket']);
-            await run('rclone', ['copyto', `${loc.remoteDir}/${loc.name}.sha256`, localSha, '--s3-no-check-bucket']);
-            await run('rclone', ['copyto', `${loc.remoteDir}/${loc.name}.manifest.json`, localManifest, '--s3-no-check-bucket']);
+            const transferFlags = ['--s3-no-check-bucket', '--retries', '5', '--low-level-retries', '10', '--contimeout', '30s', '--timeout', '10m'];
+            await run('rclone', ['copyto', `${loc.remoteDir}/${loc.name}`, localBundle, ...transferFlags]);
+            await run('rclone', ['copyto', `${loc.remoteDir}/${loc.name}.sha256`, localSha, ...transferFlags]);
+            await run('rclone', ['copyto', `${loc.remoteDir}/${loc.name}.manifest.json`, localManifest, ...transferFlags]);
 
             const expected = fs.readFileSync(localSha, 'utf8').trim().split(/\s+/)[0];
             const actual = sha256File(localBundle);
@@ -604,91 +690,64 @@ jobs:
             if (stillMissing.length) throw new Error(`Target is missing required extensions: ${stillMissing.join(', ')}`);
           }
 
-          async function createSafetyBackup(dbUrl) {
-            console.log('Existing target detected: creating mandatory pre-restore safety backup first.');
-            fs.rmSync('safety_work', { recursive: true, force: true });
-            fs.mkdirSync('safety_work', { recursive: true });
-            const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
-            const base = `${suffix}_${stamp}_pre_restore_safety_${expectedFormat}`;
-            const dir = path.join('safety_work', base);
-            fs.mkdirSync(dir, { recursive: true });
-            const roles = path.join(dir, 'roles.sql');
-            const schema = path.join(dir, 'schema.sql');
-            const data = path.join(dir, 'data.sql');
-            const histSchema = path.join(dir, 'history_schema.sql');
-            const histData = path.join(dir, 'history_data.sql');
+          async function assertRequiredExtensionsPresent(dbUrl, manifest) {
+            const target = new Set(await collectExtensionNames(dbUrl));
+            const missing = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !target.has(x));
+            if (missing.length) {
+              throw new Error(`Existing target is missing required extension(s): ${missing.join(', ')}. No target data was changed. Enable the extension(s) first or restore to a clean/new project.`);
+            }
+          }
 
-            const maintenanceUrl = maintenanceDbUrl(dbUrl);
-            await run('supabase', ['db','dump','--db-url',maintenanceUrl,'-f',roles,'--role-only'], { echoStdout: true });
-            await run('supabase', ['db','dump','--db-url',maintenanceUrl,'-f',schema], { echoStdout: true });
-            await run('supabase', ['db','dump','--db-url',maintenanceUrl,'-f',data,'--use-copy','--data-only','-x','storage.buckets_vectors','-x','storage.vector_indexes'], { echoStdout: true });
-            for (const f of [roles, schema, data]) if (!fs.existsSync(f) || fs.statSync(f).size === 0) throw new Error(`Safety dump component is empty: ${path.basename(f)}`);
-
-            let hasHistory = false;
-            if (await relationExists(dbUrl, 'supabase_migrations.schema_migrations')) {
-              try {
-                await run('supabase', ['db','dump','--db-url',maintenanceUrl,'-f',histSchema,'--schema','supabase_migrations']);
-                await run('supabase', ['db','dump','--db-url',maintenanceUrl,'-f',histData,'--use-copy','--data-only','--schema','supabase_migrations']);
-                hasHistory = fs.existsSync(histSchema) && fs.existsSync(histData) && fs.statSync(histSchema).size > 0;
-              } catch (_) { hasHistory = false; }
+          function makeTransactionalVerificationSql(manifest, file) {
+            const checks = new Map();
+            const expectedCounts = manifest.verification?.copy_row_counts || {};
+            for (const [key, rawExpected] of Object.entries(expectedCounts)) {
+              const idx = key.indexOf('.');
+              const schema = idx > 0 ? key.slice(0, idx) : '';
+              const isApp = !managedSchemas.has(schema) && !schema.startsWith('pg_') && schema !== 'information_schema';
+              const isKeyManaged = ['auth.users','auth.identities','storage.buckets','storage.objects'].includes(key);
+              if (!isApp && !isKeyManaged) continue;
+              const expected = Number(rawExpected);
+              if (!Number.isSafeInteger(expected) || expected < 0) throw new Error(`Invalid manifest row count for ${key}: ${rawExpected}`);
+              checks.set(key, expected);
             }
 
-            const copyCounts = parseCopyCounts(data);
-            const components = {};
-            for (const f of [roles, schema, data, ...(hasHistory ? [histSchema, histData] : [])]) {
-              components[path.basename(f)] = { sha256: sha256File(f), bytes: fs.statSync(f).size };
+            const critical = [
+              ['auth.users', 'auth_users_count'],
+              ['auth.identities', 'auth_identities_count'],
+              ['storage.buckets', 'storage_buckets_count'],
+              ['storage.objects', 'storage_objects_count']
+            ];
+            for (const [key, manifestKey] of critical) {
+              const rawExpected = manifest.verification?.[manifestKey];
+              if (rawExpected === undefined || rawExpected === null) throw new Error(`Manifest is missing critical verification field ${manifestKey}.`);
+              const expected = Number(rawExpected);
+              if (!Number.isSafeInteger(expected) || expected < 0) throw new Error(`Invalid manifest row count for ${key}: ${rawExpected}`);
+              if (checks.has(key) && checks.get(key) !== expected) throw new Error(`Manifest row-count fields disagree for ${key}.`);
+              checks.set(key, expected);
             }
-            const manifest = {
-              format: expectedFormat,
-              format_version: 1,
-              source_slug: suffix,
-              created_at_utc: new Date().toISOString(),
-              supabase_cli_version: process.env.SUPABASE_CLI_VERSION || 'unknown',
-              postgres_server_version: await psql(dbUrl, 'SHOW server_version;'),
-              components,
-              has_migration_history: hasHistory,
-              safety_snapshot_before_restore: true,
-              verification: {
-                copy_row_counts: copyCounts,
-                auth_users_count: copyCounts['auth.users'] ?? await countTable(dbUrl, 'auth.users'),
-                auth_identities_count: copyCounts['auth.identities'] ?? await countTable(dbUrl, 'auth.identities'),
-                storage_buckets_count: copyCounts['storage.buckets'] ?? await countTable(dbUrl, 'storage.buckets'),
-                storage_objects_count: copyCounts['storage.objects'] ?? await countTable(dbUrl, 'storage.objects'),
-                vault_secrets_count: await countTable(dbUrl, 'vault.secrets'),
-                extensions: await collectExtensions(dbUrl),
-                realtime_publication_tables: await collectRealtimeTables(dbUrl),
-                managed_schema_signatures: await collectManagedSignatures(dbUrl),
-                custom_login_roles: []
-              },
-              limitations: {
-                storage_object_files_included: false,
-                auth_storage_custom_schema_automatically_recreated: false,
-                encryption_root_key_included: false,
-                edge_functions_included: false,
-                auth_settings_and_api_keys_included: false
-              }
-            };
-            const manifestFile = path.join(dir, 'manifest.json');
-            fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2) + '\n');
-            const bundle = path.join('safety_work', `${base}.tar.gz`);
-            const archive = ['roles.sql','schema.sql','data.sql','manifest.json'];
-            if (hasHistory) archive.push('history_schema.sql','history_data.sql');
-            await run('tar', ['-czf', path.resolve(bundle), '-C', dir, ...archive]);
-            const sha = sha256File(bundle);
-            const shaFile = `${bundle}.sha256`;
-            const sideManifest = `${bundle}.manifest.json`;
-            fs.writeFileSync(shaFile, `${sha}  ${path.basename(bundle)}\n`);
-            fs.copyFileSync(manifestFile, sideManifest);
 
-            const remoteDir = `r2:${bucket}/${safetyPrefix}/${suffix}`;
-            await run('rclone', ['copyto', bundle, `${remoteDir}/${path.basename(bundle)}`, '--s3-no-check-bucket']);
-            await run('rclone', ['copyto', shaFile, `${remoteDir}/${path.basename(shaFile)}`, '--s3-no-check-bucket']);
-            await run('rclone', ['copyto', sideManifest, `${remoteDir}/${path.basename(sideManifest)}`, '--s3-no-check-bucket']);
-            const verify = path.join('safety_work', `verify_${path.basename(bundle)}`);
-            await run('rclone', ['copyto', `${remoteDir}/${path.basename(bundle)}`, verify, '--s3-no-check-bucket']);
-            if (sha256File(verify) !== sha) throw new Error('Safety backup remote verification failed. Restore will NOT proceed.');
-            console.log(`Safety backup verified on R2: ${safetyPrefix}/${suffix}/${path.basename(bundle)}`);
-            return { currentSchemaFile: schema };
+            const lines = [
+              '-- Hard verification executed inside the restore transaction before COMMIT.',
+              'SET session_replication_role = origin;'
+            ];
+            for (const [key, expected] of [...checks.entries()].sort(([a],[b]) => a.localeCompare(b))) {
+              const label = key.replace(/'/g, "''");
+              lines.push(`DO $verify$ BEGIN IF (SELECT count(*)::bigint FROM ${quoteQualified(key)}) <> ${expected}::bigint THEN RAISE EXCEPTION USING MESSAGE = 'Transactional row-count verification failed for ${label}: expected ${expected}'; END IF; END $verify$;`);
+            }
+            fs.writeFileSync(file, lines.join('\n') + '\n');
+            return checks.size;
+          }
+
+          async function captureCurrentSchemaForPreflight(dbUrl) {
+            // This is NOT a safety backup and is never uploaded to R2. It is a temporary
+            // local schema snapshot used only to compare/preflight an existing target.
+            const schema = path.resolve('restore_work/current_target_schema.sql');
+            await dumpWithRetry(dbUrl, schema, [], `[${suffix}] current target schema preflight dump`);
+            if (!fs.existsSync(schema) || fs.statSync(schema).size === 0) {
+              throw new Error('Current target schema preflight dump is empty. No target data was changed.');
+            }
+            return schema;
           }
 
           async function terminateClientSessions(dbUrl) {
@@ -710,6 +769,9 @@ jobs:
             await ensureExtensions(dbUrl, manifest);
             const realtimeFile = path.resolve('restore_work/realtime.sql');
             await makeRealtimeSql(manifest, dbUrl, realtimeFile);
+            const transactionalVerifyFile = path.resolve('restore_work/verify_before_commit.sql');
+            const transactionalChecks = makeTransactionalVerificationSql(manifest, transactionalVerifyFile);
+            console.log(`Prepared ${transactionalChecks} hard row-count check(s) to execute before COMMIT.`);
             const rolesPath = 'restore_work/roles.sql';
             const schemaPath = 'restore_work/schema.sql';
 
@@ -724,7 +786,7 @@ jobs:
               if (manifest.has_migration_history && fs.existsSync('restore_work/history_schema.sql') && fs.existsSync('restore_work/history_data.sql')) {
                 args.push('--file',path.resolve('restore_work/history_schema.sql'),'--file',path.resolve('restore_work/history_data.sql'));
               }
-              args.push('--file', realtimeFile);
+              args.push('--file', realtimeFile, '--file', transactionalVerifyFile);
               return args;
             };
 
@@ -734,7 +796,7 @@ jobs:
               const after = before.split(/\r?\n/).map(line => {
                 if (!/^\s*--/.test(line) && matcher(line)) {
                   changed++;
-                  return `-- v9 compatibility (${reason}): ${line}`;
+                  return `-- v13 compatibility (${reason}): ${line}`;
                 }
                 return line;
               }).join('\n');
@@ -797,13 +859,14 @@ jobs:
           }
 
           async function restoreExistingCompatibleTarget(dbUrl, manifest, currentSchemaFile) {
+            await assertRequiredExtensionsPresent(dbUrl, manifest);
             const backupFp = schemaFingerprint('restore_work/schema.sql');
             const currentFp = schemaFingerprint(currentSchemaFile);
             console.log(`Schema fingerprint backup=${backupFp}`);
             console.log(`Schema fingerprint target=${currentFp}`);
             if (backupFp !== currentFp) {
-              console.warn('Schema dump fingerprints differ. v9 does NOT treat a raw schema.sql hash mismatch as proof of incompatibility because separate Supabase projects can produce different dump text for platform/environment details.');
-              console.warn('v9 will instead run a structural COPY-column preflight, then let PostgreSQL validate the actual data load inside one transaction. Any incompatibility causes a full rollback.');
+              console.warn('Schema dump fingerprints differ. v13 does NOT treat a raw schema.sql hash mismatch as proof of incompatibility because separate Supabase projects can produce different dump text for platform/environment details.');
+              console.warn('v13 will instead run a structural COPY-column preflight, then let PostgreSQL validate the actual data load inside one transaction. Any incompatibility causes a full rollback.');
             } else {
               console.log('Schema dump fingerprints are identical.');
             }
@@ -825,8 +888,8 @@ jobs:
 
             // Existing-target restore is intentionally DATA-ONLY. It preserves the
             // target schema and restores the selected snapshot's rows. If schema.sql
-            // differs, the safety backup plus single PostgreSQL transaction protect
-            // the target: COPY/constraints/types are validated by PostgreSQL itself.
+            // differs, the structural preflight plus single PostgreSQL transaction protect
+            // against partial writes: COPY/constraints/types are validated by PostgreSQL itself.
             // For an exact schema rollback, restore to a clean/new Supabase project.
             const truncateSql = [
               "SET lock_timeout = '30s';",
@@ -836,31 +899,45 @@ jobs:
             ].join('\n') + '\n';
             fs.writeFileSync('restore_work/truncate.sql', truncateSql);
 
-            function makeInPlaceDataFile(inputFile, outputFile) {
-              const lines = fs.readFileSync(inputFile, 'utf8').split(/\r?\n/);
+            async function makeInPlaceDataFile(inputFile, outputFile) {
+              const input = fs.createReadStream(inputFile, { encoding: 'utf8', highWaterMark: 1024 * 1024 });
+              const rl = readline.createInterface({ input, crlfDelay: Infinity });
+              const output = fs.createWriteStream(outputFile, { encoding: 'utf8', flags: 'w' });
               let removed = 0;
-              const out = lines.map(line => {
-                if (/^\s*SELECT\s+pg_catalog\.setval\s*\(/i.test(line)) {
-                  removed++;
-                  return `-- in-place restore v9: preserved target sequence state; skipped: ${line}`;
+              try {
+                for await (const line of rl) {
+                  let outLine = line;
+                  if (/^\s*SELECT\s+pg_catalog\.setval\s*\(/i.test(line)) {
+                    removed++;
+                    outLine = `-- in-place restore: preserved target sequence state; skipped: ${line}`;
+                  }
+                  if (!output.write(outLine + '\n')) await once(output, 'drain');
                 }
-                return line;
-              });
-              fs.writeFileSync(outputFile, out.join('\n'));
-              return removed;
+                output.end();
+                await once(output, 'finish');
+                return removed;
+              } catch (err) {
+                output.destroy();
+                throw err;
+              } finally {
+                rl.close();
+              }
             }
 
             const inPlaceData = path.resolve('restore_work/data_inplace.sql');
-            let skippedSetvals = makeInPlaceDataFile('restore_work/data.sql', inPlaceData);
+            let skippedSetvals = await makeInPlaceDataFile('restore_work/data.sql', inPlaceData);
             let inPlaceHistoryData = null;
             if (historyData) {
               inPlaceHistoryData = path.resolve('restore_work/history_data_inplace.sql');
-              skippedSetvals += makeInPlaceDataFile(historyData, inPlaceHistoryData);
+              skippedSetvals += await makeInPlaceDataFile(historyData, inPlaceHistoryData);
             }
             console.log(`In-place sequence protection: CONTINUE IDENTITY; skipped ${skippedSetvals} pg_dump setval statement(s).`);
 
             const realtimeFile = path.resolve('restore_work/realtime.sql');
             await makeRealtimeSql(manifest, dbUrl, realtimeFile);
+            const transactionalVerifyFile = path.resolve('restore_work/verify_before_commit.sql');
+            const transactionalChecks = makeTransactionalVerificationSql(manifest, transactionalVerifyFile);
+            console.log(`Prepared ${transactionalChecks} hard row-count check(s) to execute before COMMIT.`);
 
             const args = [
               '-X','--single-transaction','--variable','ON_ERROR_STOP=1',
@@ -871,7 +948,7 @@ jobs:
               '--file',inPlaceData
             ];
             if (inPlaceHistoryData) args.push('--file',inPlaceHistoryData);
-            args.push('--file', realtimeFile);
+            args.push('--file', realtimeFile, '--file', transactionalVerifyFile);
 
             let lastErr;
             for (let attempt = 1; attempt <= 4; attempt++) {
@@ -933,6 +1010,26 @@ jobs:
               else if (Number(actual) !== Number(expected)) errors.push(`row count ${key}: expected=${expected}, actual=${actual}`);
             }
 
+            // Independent hard verification for critical Supabase data. Do not rely only on
+            // copy_row_counts containing these keys: the manifest stores dedicated counts and a
+            // missing/mismatched Auth or Storage metadata table must fail verification.
+            const criticalChecks = [
+              ['auth.users', 'auth_users_count'],
+              ['auth.identities', 'auth_identities_count'],
+              ['storage.buckets', 'storage_buckets_count'],
+              ['storage.objects', 'storage_objects_count']
+            ];
+            for (const [key, manifestKey] of criticalChecks) {
+              const expected = manifest.verification?.[manifestKey];
+              if (expected === undefined || expected === null) {
+                errors.push(`manifest is missing critical verification field ${manifestKey}`);
+                continue;
+              }
+              const actual = await countTable(dbUrl, key);
+              if (actual === null) errors.push(`missing critical table ${key}`);
+              else if (Number(actual) !== Number(expected)) errors.push(`critical row count ${key}: expected=${expected}, actual=${actual}`);
+            }
+
             // auth/storage/realtime are Supabase-managed schemas. A normal logical dump/restore
             // does not guarantee byte-for-byte identity of all platform-managed triggers/policies,
             // and Supabase documents custom auth/storage schema changes as a separate migration step.
@@ -975,8 +1072,10 @@ jobs:
 
             const storageObjects = Number(manifest.verification?.storage_objects_count || 0);
             const vaultSecrets = Number(manifest.verification?.vault_secrets_count || 0);
+            const customLoginRoles = manifest.verification?.custom_login_roles || [];
             if (storageObjects > 0) warnings.push(`backup contains ${storageObjects} storage.objects metadata rows; actual Storage files are outside logical DB backup`);
             if (vaultSecrets > 0) warnings.push(`backup contains ${vaultSecrets} Vault secret rows; a newly created project has a different root encryption key unless migrated separately`);
+            if (customLoginRoles.length) warnings.push(`backup contains ${customLoginRoles.length} custom LOGIN role(s); Supabase logical role dumps do not preserve custom role passwords, so passwords must be set separately after a clean/new-project restore`);
             warnings.push('Auth settings/API keys/Edge Functions and other project-level settings are outside this logical database restore.');
 
             for (const w of warnings) console.warn(`WARNING: ${w}`);
@@ -1005,9 +1104,10 @@ jobs:
             } else {
               restoreMode = 'existing';
               console.log(`Target already contains data: ${state.dirty.join(', ')}`);
-              console.log('Existing-target mode: safety backup -> structural COPY compatibility preflight -> transactional data rollback.');
-              const safety = await createSafetyBackup(target.dbUrl);
-              await restoreExistingCompatibleTarget(target.dbUrl, manifest, safety.currentSchemaFile);
+              console.log('Existing-target mode: local schema preflight -> structural COPY compatibility preflight -> transactional data restore.');
+              console.warn('PRE-RESTORE SAFETY SNAPSHOT IS DISABLED: after a successful COMMIT, this workflow has no automatic copy of the immediately previous target state.');
+              const currentSchemaFile = await captureCurrentSchemaForPreflight(target.dbUrl);
+              await restoreExistingCompatibleTarget(target.dbUrl, manifest, currentSchemaFile);
             }
 
             await verifyTarget(target.dbUrl, manifest, restoreMode);
@@ -1020,11 +1120,11 @@ jobs:
             process.exit(1);
           });
           NODE
-          node restore_direct_v9.js
+          node restore_direct_v14.js
 
       - name: Cleanup local credentials and work files
         if: always()
         run: |
           set +e
           rm -f ~/.config/rclone/rclone.conf
-          rm -rf restore_work safety_work restore_direct_v9.js
+          rm -rf restore_work restore_direct_v14.js
