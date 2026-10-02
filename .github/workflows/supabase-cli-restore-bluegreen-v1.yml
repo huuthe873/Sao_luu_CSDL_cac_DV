@@ -1,4 +1,4 @@
-name: Supabase CLI Restore Direct v8 - tolerant managed-schema verification
+name: Supabase CLI Restore Direct v9 - session-pooler maintenance and network retry
 
 on:
   workflow_dispatch:
@@ -107,7 +107,7 @@ jobs:
           INPUT_BACKUP_FILE: ${{ github.event.inputs.backup_file }}
         run: |
           set -euo pipefail
-          cat > restore_direct_v8.js <<'NODE'
+          cat > restore_direct_v9.js <<'NODE'
           const fs = require('fs');
           const path = require('path');
           const crypto = require('crypto');
@@ -169,6 +169,28 @@ jobs:
 
           function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+          let maintenanceRouteLogged = false;
+
+          function maintenanceDbUrl(dbUrl) {
+            const u = new URL(dbUrl);
+            if (!['postgres:', 'postgresql:'].includes(u.protocol)) throw new Error('Invalid PostgreSQL URL protocol.');
+
+            // Supabase shared pooler: 6543 = transaction mode, 5432 = session mode.
+            // Long-running maintenance/restore work must not use transaction mode.
+            if (u.hostname.endsWith('.pooler.supabase.com') && u.port === '6543') {
+              u.port = '5432';
+              if (!maintenanceRouteLogged) {
+                console.log('MAINTENANCE CONNECTION: detected Supabase shared transaction pooler :6543; automatically switching restore/dump traffic to session pooler :5432 on the same host.');
+                maintenanceRouteLogged = true;
+              }
+            }
+            return u.toString();
+          }
+
+          function isTransientPgConnectionError(text) {
+            return /(SSL error:\s*unexpected eof|server closed the connection unexpectedly|connection reset by peer|broken pipe|connection timed out|timeout expired|could not receive data from server|could not send data to server|terminating connection due to administrator command|the database system is starting up|cannot connect now|network is unreachable|no route to host|temporary failure in name resolution)/i.test(String(text || ''));
+          }
+
           async function d1Query(sql, params = []) {
             const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/d1/database/${cfDbId}/query`;
             const resp = await fetch(url, {
@@ -192,8 +214,7 @@ jobs:
           }
 
           function pgEnvFromUrl(dbUrl) {
-            const u = new URL(dbUrl);
-            if (!['postgres:', 'postgresql:'].includes(u.protocol)) throw new Error('Invalid PostgreSQL URL protocol.');
+            const u = new URL(maintenanceDbUrl(dbUrl));
             return {
               ...process.env,
               PGHOST: u.hostname,
@@ -202,15 +223,33 @@ jobs:
               PGPASSWORD: decodeURIComponent(u.password),
               PGDATABASE: decodeURIComponent((u.pathname || '/postgres').replace(/^\//, '')) || 'postgres',
               PGSSLMODE: u.searchParams.get('sslmode') || 'require',
-              PGCONNECT_TIMEOUT: '20'
+              PGCONNECT_TIMEOUT: '30',
+              PGKEEPALIVES: '1',
+              PGKEEPALIVESIDLE: '30',
+              PGKEEPALIVESINTERVAL: '10',
+              PGKEEPALIVESCOUNT: '5',
+              PGAPPNAME: `supabase-restore-${suffix}`
             };
           }
 
           async function psql(dbUrl, sql, fieldSep = '\t') {
-            const { stdout } = await run('psql', ['-X', '-v', 'ON_ERROR_STOP=1', '-A', '-t', '-F', fieldSep, '-c', sql], {
-              env: pgEnvFromUrl(dbUrl), echoStderr: false
-            });
-            return stdout.trim();
+            let lastErr;
+            for (let attempt = 1; attempt <= 4; attempt++) {
+              try {
+                const { stdout } = await run('psql', ['-X', '-v', 'ON_ERROR_STOP=1', '-A', '-t', '-F', fieldSep, '-c', sql], {
+                  env: pgEnvFromUrl(dbUrl), echoStderr: false
+                });
+                return stdout.trim();
+              } catch (err) {
+                lastErr = err;
+                const msg = safeError(err);
+                if (!isTransientPgConnectionError(msg) || attempt === 4) throw err;
+                const wait = [2, 5, 10][attempt - 1] || 10;
+                console.warn(`Transient PostgreSQL connection error during maintenance query (attempt ${attempt}/4). Retrying in ${wait}s: ${msg.split('\n')[0]}`);
+                await sleep(wait * 1000);
+              }
+            }
+            throw lastErr;
           }
 
           async function relationExists(dbUrl, regclass) {
@@ -579,16 +618,17 @@ jobs:
             const histSchema = path.join(dir, 'history_schema.sql');
             const histData = path.join(dir, 'history_data.sql');
 
-            await run('supabase', ['db','dump','--db-url',dbUrl,'-f',roles,'--role-only'], { echoStdout: true });
-            await run('supabase', ['db','dump','--db-url',dbUrl,'-f',schema], { echoStdout: true });
-            await run('supabase', ['db','dump','--db-url',dbUrl,'-f',data,'--use-copy','--data-only','-x','storage.buckets_vectors','-x','storage.vector_indexes'], { echoStdout: true });
+            const maintenanceUrl = maintenanceDbUrl(dbUrl);
+            await run('supabase', ['db','dump','--db-url',maintenanceUrl,'-f',roles,'--role-only'], { echoStdout: true });
+            await run('supabase', ['db','dump','--db-url',maintenanceUrl,'-f',schema], { echoStdout: true });
+            await run('supabase', ['db','dump','--db-url',maintenanceUrl,'-f',data,'--use-copy','--data-only','-x','storage.buckets_vectors','-x','storage.vector_indexes'], { echoStdout: true });
             for (const f of [roles, schema, data]) if (!fs.existsSync(f) || fs.statSync(f).size === 0) throw new Error(`Safety dump component is empty: ${path.basename(f)}`);
 
             let hasHistory = false;
             if (await relationExists(dbUrl, 'supabase_migrations.schema_migrations')) {
               try {
-                await run('supabase', ['db','dump','--db-url',dbUrl,'-f',histSchema,'--schema','supabase_migrations']);
-                await run('supabase', ['db','dump','--db-url',dbUrl,'-f',histData,'--use-copy','--data-only','--schema','supabase_migrations']);
+                await run('supabase', ['db','dump','--db-url',maintenanceUrl,'-f',histSchema,'--schema','supabase_migrations']);
+                await run('supabase', ['db','dump','--db-url',maintenanceUrl,'-f',histData,'--use-copy','--data-only','--schema','supabase_migrations']);
                 hasHistory = fs.existsSync(histSchema) && fs.existsSync(histData) && fs.statSync(histSchema).size > 0;
               } catch (_) { hasHistory = false; }
             }
@@ -694,7 +734,7 @@ jobs:
               const after = before.split(/\r?\n/).map(line => {
                 if (!/^\s*--/.test(line) && matcher(line)) {
                   changed++;
-                  return `-- v8 compatibility (${reason}): ${line}`;
+                  return `-- v9 compatibility (${reason}): ${line}`;
                 }
                 return line;
               }).join('\n');
@@ -730,6 +770,24 @@ jobs:
               } catch (err) {
                 lastErr = err;
                 const msg = safeError(err);
+
+                if (isTransientPgConnectionError(msg)) {
+                  // If the network vanished after COMMIT reached the server, psql may not know
+                  // whether COMMIT succeeded. Verify first; only retry if verification does not pass.
+                  try {
+                    await verifyTarget(dbUrl, manifest, 'clean');
+                    console.warn('Transient connection loss occurred, but post-restore verification PASSED. Treating the restore as committed successfully.');
+                    return;
+                  } catch (_) {
+                    if (attempt < 8) {
+                      const wait = [5, 10, 20, 30, 30, 30, 30][attempt - 1] || 30;
+                      console.warn(`Transient PostgreSQL connection loss; restore outcome was not verified as complete. Retrying the full single-transaction restore in ${wait}s.`);
+                      await sleep(wait * 1000);
+                      continue;
+                    }
+                  }
+                }
+
                 const changed = patchCompatibilityError(msg);
                 if (!changed || attempt === 8) throw err;
                 console.warn(`Restore transaction rolled back. Applied ${changed} narrowly-scoped Supabase compatibility patch(es); retrying.`);
@@ -744,8 +802,8 @@ jobs:
             console.log(`Schema fingerprint backup=${backupFp}`);
             console.log(`Schema fingerprint target=${currentFp}`);
             if (backupFp !== currentFp) {
-              console.warn('Schema dump fingerprints differ. v8 does NOT treat a raw schema.sql hash mismatch as proof of incompatibility because separate Supabase projects can produce different dump text for platform/environment details.');
-              console.warn('v8 will instead run a structural COPY-column preflight, then let PostgreSQL validate the actual data load inside one transaction. Any incompatibility causes a full rollback.');
+              console.warn('Schema dump fingerprints differ. v9 does NOT treat a raw schema.sql hash mismatch as proof of incompatibility because separate Supabase projects can produce different dump text for platform/environment details.');
+              console.warn('v9 will instead run a structural COPY-column preflight, then let PostgreSQL validate the actual data load inside one transaction. Any incompatibility causes a full rollback.');
             } else {
               console.log('Schema dump fingerprints are identical.');
             }
@@ -784,7 +842,7 @@ jobs:
               const out = lines.map(line => {
                 if (/^\s*SELECT\s+pg_catalog\.setval\s*\(/i.test(line)) {
                   removed++;
-                  return `-- in-place restore v8: preserved target sequence state; skipped: ${line}`;
+                  return `-- in-place restore v9: preserved target sequence state; skipped: ${line}`;
                 }
                 return line;
               });
@@ -829,13 +887,33 @@ jobs:
               } catch (err) {
                 lastErr = err;
                 const msg = safeError(err);
+
+                if (isTransientPgConnectionError(msg)) {
+                  // A dropped client connection aborts an uncommitted PostgreSQL transaction.
+                  // If COMMIT may already have succeeded, verification resolves the ambiguity
+                  // before any retry. Replaying this snapshot is safe because the existing-target
+                  // path truncates and reloads the same data inside one transaction.
+                  try {
+                    await verifyTarget(dbUrl, manifest, 'existing');
+                    console.warn('Transient connection loss occurred, but post-restore verification PASSED. Treating the restore as committed successfully.');
+                    return;
+                  } catch (_) {
+                    if (attempt < 4) {
+                      const wait = [5, 10, 20][attempt - 1] || 20;
+                      console.warn(`Transient PostgreSQL connection loss; target does not yet verify as restored. Retrying in ${wait}s.`);
+                      await sleep(wait * 1000);
+                      continue;
+                    }
+                  }
+                }
+
                 if (/(deadlock detected|lock timeout|could not obtain lock|canceling statement due to lock timeout)/i.test(msg) && attempt < 4) {
                   const wait = [5, 10, 20, 30][attempt - 1];
                   console.warn(`Lock contention detected; transaction rolled back. Retrying in ${wait}s.`);
                   await sleep(wait * 1000);
                   continue;
                 }
-                throw new Error(`Existing-target restore was rejected by PostgreSQL and fully rolled back. This normally means the current schema/data constraints are not compatible with the selected backup. Original error: ${msg}`);
+                throw new Error(`Existing-target restore was rejected by PostgreSQL and fully rolled back. This normally means the current schema/data constraints are not compatible with the selected backup, or the database connection remained unavailable after retries. Original error: ${msg}`);
               }
             }
             throw lastErr;
@@ -942,11 +1020,11 @@ jobs:
             process.exit(1);
           });
           NODE
-          node restore_direct_v8.js
+          node restore_direct_v9.js
 
       - name: Cleanup local credentials and work files
         if: always()
         run: |
           set +e
           rm -f ~/.config/rclone/rclone.conf
-          rm -rf restore_work safety_work restore_direct_v8.js
+          rm -rf restore_work safety_work restore_direct_v9.js
