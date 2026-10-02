@@ -1,0 +1,642 @@
+name: Supabase CLI Restore to Clean Project - BlueGreen v1
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: 'restore_verify | restore_verify_cutover | verify_cutover_only | rollback_swap'
+        required: true
+        default: 'restore_verify'
+        type: choice
+        options:
+          - restore_verify
+          - restore_verify_cutover
+          - verify_cutover_only
+          - rollback_swap
+      production_slug:
+        description: 'Slug logic dang phuc vu production trong D1'
+        required: true
+        type: string
+      clean_target_slug:
+        description: 'Slug D1 tro toi Supabase project/database SACH dung lam Blue/Green target'
+        required: true
+        type: string
+      backup_source_slug:
+        description: 'Slug thu muc backup tren R2; co the khac production_slug'
+        required: false
+        type: string
+      backup_file:
+        description: 'latest hoac ten bundle .tar.gz (chap nhan ca .sha256/.manifest.json/path)'
+        required: false
+        default: 'latest'
+        type: string
+      allow_cross_school_restore:
+        description: 'Bat buoc true neu backup_source_slug khac production_slug'
+        required: true
+        default: false
+        type: boolean
+      storage_objects_migrated:
+        description: 'Xac nhan file/object Supabase Storage da duoc migrate rieng neu backup nguon co Storage objects'
+        required: true
+        default: false
+        type: boolean
+      encryption_root_key_migrated:
+        description: 'Xac nhan encryption root key/Vault da duoc xu ly neu nguon co Vault secrets'
+        required: true
+        default: false
+        type: boolean
+      custom_role_passwords_configured:
+        description: 'Xac nhan password cho custom LOGIN roles da duoc cau hinh neu co'
+        required: true
+        default: false
+        type: boolean
+      external_supabase_settings_configured:
+        description: 'Xac nhan Auth settings/API keys/Edge Functions/other project settings can thiet da san sang truoc cutover'
+        required: true
+        default: false
+        type: boolean
+      confirm_production_slug:
+        description: 'Chi can cho cutover/rollback: nhap lai CHINH XAC production_slug'
+        required: false
+        type: string
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-db-bluegreen-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  BACKUP_FORMAT: supabase-cli-r2-v1
+  BACKUP_PREFIX: database_backups_cli
+  SUPABASE_CLI_VERSION: '2.117.0'
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v3.0.1
+        with:
+          version: ${{ env.SUPABASE_CLI_VERSION }}
+
+      - name: Install PostgreSQL client and rclone
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client curl ca-certificates
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          supabase --version
+          psql --version
+          rclone version | head -n 1
+
+      - name: Configure Cloudflare R2
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          : "${CF_ACCOUNT_ID:?Missing CF_ACCOUNT_ID}"
+          : "${R2_ACCESS_KEY_ID:?Missing R2_ACCESS_KEY_ID}"
+          : "${R2_SECRET_ACCESS_KEY:?Missing R2_SECRET_ACCESS_KEY}"
+          mkdir -p ~/.config/rclone
+          chmod 700 ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $R2_ACCESS_KEY_ID
+          secret_access_key = $R2_SECRET_ACCESS_KEY
+          region = auto
+          endpoint = https://$CF_ACCOUNT_ID.r2.cloudflarestorage.com
+          no_check_bucket = true
+          EOF
+          chmod 600 ~/.config/rclone/rclone.conf
+
+      - name: Restore, verify and optional atomic D1 cutover
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_D1_DB_ID: ${{ secrets.CF_D1_DB_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          OPERATION: ${{ github.event.inputs.operation }}
+          PRODUCTION_SLUG: ${{ github.event.inputs.production_slug }}
+          CLEAN_TARGET_SLUG: ${{ github.event.inputs.clean_target_slug }}
+          BACKUP_SOURCE_SLUG: ${{ github.event.inputs.backup_source_slug }}
+          BACKUP_FILE: ${{ github.event.inputs.backup_file }}
+          ALLOW_CROSS: ${{ github.event.inputs.allow_cross_school_restore }}
+          STORAGE_OBJECTS_MIGRATED: ${{ github.event.inputs.storage_objects_migrated }}
+          ENCRYPTION_ROOT_KEY_MIGRATED: ${{ github.event.inputs.encryption_root_key_migrated }}
+          CUSTOM_ROLE_PASSWORDS_CONFIGURED: ${{ github.event.inputs.custom_role_passwords_configured }}
+          EXTERNAL_SETTINGS_CONFIGURED: ${{ github.event.inputs.external_supabase_settings_configured }}
+          CONFIRM_PRODUCTION_SLUG: ${{ github.event.inputs.confirm_production_slug }}
+        run: |
+          set -euo pipefail
+          cat > restore_bluegreen.js <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+          const { spawn } = require('child_process');
+
+          const cfAccountId = process.env.CF_ACCOUNT_ID || '';
+          const cfApiToken = process.env.CF_API_TOKEN || '';
+          const cfDbId = process.env.CF_D1_DB_ID || '';
+          const bucket = process.env.R2_BUCKET_NAME || '';
+          const prefix = process.env.BACKUP_PREFIX || 'database_backups_cli';
+          const expectedFormat = process.env.BACKUP_FORMAT || 'supabase-cli-r2-v1';
+
+          const operation = (process.env.OPERATION || 'restore_verify').trim();
+          const productionSlug = (process.env.PRODUCTION_SLUG || '').trim();
+          const cleanTargetSlug = (process.env.CLEAN_TARGET_SLUG || '').trim();
+          const backupSourceSlug = (process.env.BACKUP_SOURCE_SLUG || '').trim();
+          const backupFileInput = (process.env.BACKUP_FILE || 'latest').trim();
+          const allowCross = String(process.env.ALLOW_CROSS || 'false') === 'true';
+          const storageMigrated = String(process.env.STORAGE_OBJECTS_MIGRATED || 'false') === 'true';
+          const rootKeyMigrated = String(process.env.ENCRYPTION_ROOT_KEY_MIGRATED || 'false') === 'true';
+          const rolePasswordsConfigured = String(process.env.CUSTOM_ROLE_PASSWORDS_CONFIGURED || 'false') === 'true';
+          const externalSettingsConfigured = String(process.env.EXTERNAL_SETTINGS_CONFIGURED || 'false') === 'true';
+          const confirmProduction = (process.env.CONFIRM_PRODUCTION_SLUG || '').trim();
+
+          const restoreOps = new Set(['restore_verify', 'restore_verify_cutover', 'verify_cutover_only']);
+          const cutoverOps = new Set(['restore_verify_cutover', 'verify_cutover_only']);
+          const allOps = new Set([...restoreOps, 'rollback_swap']);
+
+          if (!cfAccountId || !cfApiToken || !cfDbId) throw new Error('Missing Cloudflare D1 secrets.');
+          if (!bucket && operation !== 'rollback_swap') throw new Error('Missing R2_BUCKET_NAME.');
+          if (!allOps.has(operation)) throw new Error(`Unsupported operation: ${operation}`);
+          for (const [name, value] of [['production_slug', productionSlug], ['clean_target_slug', cleanTargetSlug]]) {
+            if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error(`${name} is invalid.`);
+          }
+          if (productionSlug === cleanTargetSlug) throw new Error('production_slug and clean_target_slug must be different D1 rows.');
+          if (operation !== 'rollback_swap') {
+            if (!/^[A-Za-z0-9_-]+$/.test(backupSourceSlug)) throw new Error('backup_source_slug is required and invalid.');
+            if (backupSourceSlug !== productionSlug && !allowCross) {
+              throw new Error(`Cross-school restore requires allow_cross_school_restore=true: source=[${backupSourceSlug}], production=[${productionSlug}].`);
+            }
+          }
+          if ((cutoverOps.has(operation) || operation === 'rollback_swap') && confirmProduction !== productionSlug) {
+            throw new Error('confirm_production_slug must exactly match production_slug for cutover/rollback.');
+          }
+
+          const managedSchemas = new Set([
+            'auth', 'storage', 'realtime', 'graphql', 'graphql_public',
+            'extensions', 'pgbouncer', 'pgsodium', 'pgsodium_masks',
+            'vault', 'cron', 'supabase_functions', 'supabase_migrations',
+            'net', '_realtime', '_analytics'
+          ]);
+
+          function safeError(err) {
+            const text = String(err && (err.stderr || err.message || err) || 'Unknown error');
+            return text.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, '[DATABASE_URL_REDACTED]').slice(0, 12000);
+          }
+
+          function run(command, args, options = {}) {
+            return new Promise((resolve, reject) => {
+              const child = spawn(command, args, {
+                cwd: options.cwd,
+                env: options.env || process.env,
+                stdio: ['ignore', 'pipe', 'pipe']
+              });
+              let stdout = '', stderr = '';
+              child.stdout.on('data', d => {
+                const s = d.toString(); stdout += s;
+                if (options.echoStdout) process.stdout.write(s);
+                if (stdout.length > 12 * 1024 * 1024) stdout = stdout.slice(-12 * 1024 * 1024);
+              });
+              child.stderr.on('data', d => {
+                const s = d.toString(); stderr += s;
+                if (options.echoStderr !== false) process.stderr.write(s);
+                if (stderr.length > 12 * 1024 * 1024) stderr = stderr.slice(-12 * 1024 * 1024);
+              });
+              child.on('error', reject);
+              child.on('close', code => {
+                if (code === 0) return resolve({ stdout, stderr });
+                const e = new Error(`${command} exited with code ${code}`);
+                e.code = code; e.stdout = stdout; e.stderr = stderr;
+                reject(e);
+              });
+            });
+          }
+
+          async function d1Query(sql, params = []) {
+            const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/d1/database/${cfDbId}/query`;
+            const resp = await fetch(url, {
+              method: 'POST',
+              headers: { Authorization: `Bearer ${cfApiToken}`, 'Content-Type': 'application/json' },
+              body: JSON.stringify({ sql, params })
+            });
+            const body = await resp.json().catch(() => ({}));
+            if (!resp.ok || body.success === false) throw new Error(`D1 query failed: HTTP ${resp.status}; ${JSON.stringify(body.errors || body)}`);
+            const block = body.result?.[0];
+            if (!block || block.success === false) throw new Error(`D1 query result failed: ${JSON.stringify(block || body)}`);
+            return { rows: block.results || [], meta: block.meta || {} };
+          }
+
+          async function loadD1Targets() {
+            const { rows } = await d1Query(
+              'SELECT slug, supabase_sql FROM danh_sach_truong WHERE slug IN (?, ?) ORDER BY slug',
+              [productionSlug, cleanTargetSlug]
+            );
+            const map = new Map(rows.map(r => [String(r.slug), String(r.supabase_sql || '')]));
+            const productionUrl = map.get(productionSlug) || '';
+            const cleanUrl = map.get(cleanTargetSlug) || '';
+            if (!productionUrl) throw new Error(`D1 has no usable supabase_sql for production_slug [${productionSlug}].`);
+            if (!cleanUrl) throw new Error(`D1 has no usable supabase_sql for clean_target_slug [${cleanTargetSlug}].`);
+            if (productionUrl === cleanUrl) throw new Error('Production and clean target currently point to the same database URL.');
+            return { productionUrl, cleanUrl };
+          }
+
+          async function atomicSwapD1(productionUrl, cleanUrl) {
+            const sql = `UPDATE danh_sach_truong
+              SET supabase_sql = CASE slug WHEN ? THEN ? WHEN ? THEN ? ELSE supabase_sql END
+              WHERE slug IN (?, ?);`;
+            const { meta } = await d1Query(sql, [productionSlug, cleanUrl, cleanTargetSlug, productionUrl, productionSlug, cleanTargetSlug]);
+            if (meta.changes !== undefined && Number(meta.changes) < 2) throw new Error(`D1 cutover changed only ${meta.changes} row(s); expected 2.`);
+            const { rows } = await d1Query('SELECT slug, supabase_sql FROM danh_sach_truong WHERE slug IN (?, ?)', [productionSlug, cleanTargetSlug]);
+            const map = new Map(rows.map(r => [String(r.slug), String(r.supabase_sql || '')]));
+            if (map.get(productionSlug) !== cleanUrl || map.get(cleanTargetSlug) !== productionUrl) {
+              throw new Error('D1 post-cutover verification failed.');
+            }
+            console.log(`D1 SWAP OK: [${productionSlug}] now points to restored target; [${cleanTargetSlug}] retains the previous production DB for rollback.`);
+          }
+
+          function pgEnvFromUrl(dbUrl) {
+            const u = new URL(dbUrl);
+            if (!['postgres:', 'postgresql:'].includes(u.protocol)) throw new Error('Invalid PostgreSQL URL protocol.');
+            return {
+              ...process.env,
+              PGHOST: u.hostname,
+              PGPORT: u.port || '5432',
+              PGUSER: decodeURIComponent(u.username),
+              PGPASSWORD: decodeURIComponent(u.password),
+              PGDATABASE: decodeURIComponent((u.pathname || '/postgres').replace(/^\//, '')) || 'postgres',
+              PGSSLMODE: u.searchParams.get('sslmode') || 'require',
+              PGCONNECT_TIMEOUT: '20'
+            };
+          }
+
+          async function psql(dbUrl, sql, fieldSep = '\t') {
+            const { stdout } = await run('psql', ['-X', '-v', 'ON_ERROR_STOP=1', '-A', '-t', '-F', fieldSep, '-c', sql], {
+              env: pgEnvFromUrl(dbUrl), echoStderr: false
+            });
+            return stdout.trim();
+          }
+
+          async function relationExists(dbUrl, regclass) {
+            const escaped = regclass.replace(/'/g, "''");
+            return (await psql(dbUrl, `SELECT CASE WHEN to_regclass('${escaped}') IS NULL THEN '0' ELSE '1' END;`)) === '1';
+          }
+
+          function quoteQualified(key) {
+            const idx = key.indexOf('.');
+            if (idx <= 0) throw new Error(`Invalid qualified table name in manifest: ${key}`);
+            const a = key.slice(0, idx), b = key.slice(idx + 1);
+            return '"' + a.replace(/"/g, '""') + '"."' + b.replace(/"/g, '""') + '"';
+          }
+
+          async function countTable(dbUrl, key) {
+            if (!(await relationExists(dbUrl, key))) return null;
+            return Number(await psql(dbUrl, `SELECT count(*)::bigint FROM ${quoteQualified(key)};`) || 0);
+          }
+
+          async function collectManagedSignatures(dbUrl) {
+            const triggersSql = `
+              SELECT event_object_schema || '.' || event_object_table || '|' || trigger_name || '|' || event_manipulation || '|' || action_timing || '|' || action_orientation || '|' || coalesce(action_statement,'')
+              FROM information_schema.triggers
+              WHERE event_object_schema IN ('auth','storage','realtime')
+              ORDER BY 1;`;
+            const policiesSql = `
+              SELECT schemaname || '.' || tablename || '|' || policyname || '|' || cmd || '|' || permissive || '|' || coalesce(array_to_string(roles,','),'') || '|' || coalesce(qual,'') || '|' || coalesce(with_check,'')
+              FROM pg_policies
+              WHERE schemaname IN ('auth','storage','realtime')
+              ORDER BY 1;`;
+            const tr = await psql(dbUrl, triggersSql, '\x1f');
+            const po = await psql(dbUrl, policiesSql, '\x1f');
+            return { triggers: tr ? tr.split(/\r?\n/).filter(Boolean) : [], policies: po ? po.split(/\r?\n/).filter(Boolean) : [] };
+          }
+
+          async function collectExtensionNames(dbUrl) {
+            const out = await psql(dbUrl, 'SELECT extname FROM pg_extension ORDER BY extname;', '\x1f');
+            return out ? out.split(/\r?\n/).filter(Boolean) : [];
+          }
+
+          async function collectRealtimeTables(dbUrl) {
+            const pub = (await psql(dbUrl, `SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN '1' ELSE '0' END;`)) === '1';
+            if (!pub) return [];
+            const out = await psql(dbUrl, `SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname='supabase_realtime' ORDER BY schemaname, tablename;`, '\x1f');
+            return out ? out.split(/\r?\n/).filter(Boolean) : [];
+          }
+
+          async function assertCleanTarget(dbUrl) {
+            const appRelations = Number(await psql(dbUrl, `
+              SELECT count(*)
+              FROM pg_class c
+              JOIN pg_namespace n ON n.oid=c.relnamespace
+              WHERE c.relkind IN ('r','p','v','m','S')
+                AND n.nspname NOT IN ('auth','storage','realtime','graphql','graphql_public','extensions','pgbouncer','pgsodium','pgsodium_masks','vault','cron','supabase_functions','supabase_migrations','net','_realtime','_analytics','information_schema')
+                AND n.nspname NOT LIKE 'pg_%'
+                AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid=c.oid AND d.deptype='e');`));
+            const appFunctions = Number(await psql(dbUrl, `
+              SELECT count(*)
+              FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+              WHERE n.nspname NOT IN ('auth','storage','realtime','graphql','graphql_public','extensions','pgbouncer','pgsodium','pgsodium_masks','vault','cron','supabase_functions','supabase_migrations','net','_realtime','_analytics','information_schema')
+                AND n.nspname NOT LIKE 'pg_%'
+                AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid=p.oid AND d.deptype='e');`));
+            const authUsers = await countTable(dbUrl, 'auth.users');
+            const authIdentities = await countTable(dbUrl, 'auth.identities');
+            const storageObjects = await countTable(dbUrl, 'storage.objects');
+            const storageBuckets = await countTable(dbUrl, 'storage.buckets');
+            const dirty = [];
+            if (appRelations > 0) dirty.push(`application relations=${appRelations}`);
+            if (appFunctions > 0) dirty.push(`application functions=${appFunctions}`);
+            if ((authUsers || 0) > 0) dirty.push(`auth.users=${authUsers}`);
+            if ((authIdentities || 0) > 0) dirty.push(`auth.identities=${authIdentities}`);
+            if ((storageObjects || 0) > 0) dirty.push(`storage.objects=${storageObjects}`);
+            if ((storageBuckets || 0) > 0) dirty.push(`storage.buckets=${storageBuckets}`);
+            if (dirty.length) throw new Error(`Clean target check FAILED: ${dirty.join(', ')}. Use a newly created/empty Supabase target.`);
+            console.log('Clean target check OK.');
+          }
+
+          function sha256File(file) {
+            const h = crypto.createHash('sha256');
+            h.update(fs.readFileSync(file));
+            return h.digest('hex');
+          }
+
+          function normalizeBackupName(input) {
+            let v = (input || 'latest').trim().replace(/^['"]|['"]$/g, '');
+            if (!v || v.toLowerCase() === 'latest') return 'latest';
+            v = v.replace(/\\/g, '/');
+            try { if (/^https?:\/\//i.test(v)) v = new URL(v).pathname; } catch (_) {}
+            v = v.split('/').filter(Boolean).pop() || '';
+            if (v.endsWith('.tar.gz.sha256')) v = v.slice(0, -'.sha256'.length);
+            if (v.endsWith('.tar.gz.manifest.json')) v = v.slice(0, -'.manifest.json'.length);
+            if (!/^[A-Za-z0-9_.-]+\.tar\.gz$/.test(v)) throw new Error('backup_file must be latest or a safe .tar.gz/.sha256/.manifest.json backup name.');
+            return v;
+          }
+
+          async function selectAndDownloadBackup() {
+            const remoteDir = `r2:${bucket}/${prefix}/${backupSourceSlug}`;
+            const { stdout } = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket']);
+            const files = JSON.parse(stdout || '[]');
+            const map = new Map(files.map(f => [f.Path, f]));
+            let name = normalizeBackupName(backupFileInput);
+            if (name === 'latest') {
+              const complete = files
+                .filter(f => f.Path.endsWith('.tar.gz'))
+                .filter(f => map.has(`${f.Path}.sha256`) && map.has(`${f.Path}.manifest.json`))
+                .sort((a, b) => new Date(b.ModTime) - new Date(a.ModTime));
+              if (!complete.length) throw new Error(`No complete Supabase CLI backup set found in R2 for [${backupSourceSlug}].`);
+              name = complete[0].Path;
+            }
+            if (!map.has(name) || !map.has(`${name}.sha256`) || !map.has(`${name}.manifest.json`)) {
+              throw new Error(`Backup set is incomplete on R2: ${name} requires .tar.gz + .sha256 + .manifest.json.`);
+            }
+
+            fs.rmSync('restore_work', { recursive: true, force: true });
+            fs.mkdirSync('restore_work', { recursive: true });
+            const localBundle = path.join('restore_work', path.basename(name));
+            const localSha = `${localBundle}.sha256`;
+            const localManifest = `${localBundle}.manifest.json`;
+            await run('rclone', ['copyto', `${remoteDir}/${name}`, localBundle, '--s3-no-check-bucket']);
+            await run('rclone', ['copyto', `${remoteDir}/${name}.sha256`, localSha, '--s3-no-check-bucket']);
+            await run('rclone', ['copyto', `${remoteDir}/${name}.manifest.json`, localManifest, '--s3-no-check-bucket']);
+
+            const expected = fs.readFileSync(localSha, 'utf8').trim().split(/\s+/)[0];
+            const actual = sha256File(localBundle);
+            if (!/^[a-f0-9]{64}$/i.test(expected) || expected.toLowerCase() !== actual.toLowerCase()) {
+              throw new Error(`Backup SHA-256 mismatch for ${name}.`);
+            }
+
+            const outsideManifest = JSON.parse(fs.readFileSync(localManifest, 'utf8'));
+            if (outsideManifest.format !== expectedFormat || outsideManifest.format_version !== 1) {
+              throw new Error(`Unsupported backup format: ${outsideManifest.format} v${outsideManifest.format_version}`);
+            }
+            if (outsideManifest.source_slug !== backupSourceSlug) {
+              throw new Error(`Manifest source_slug [${outsideManifest.source_slug}] does not match backup_source_slug [${backupSourceSlug}].`);
+            }
+
+            const { stdout: listOut } = await run('tar', ['-tzf', localBundle]);
+            const entries = listOut.split(/\r?\n/).filter(Boolean);
+            const allowed = new Set(['roles.sql','schema.sql','data.sql','manifest.json','history_schema.sql','history_data.sql']);
+            for (const e of entries) {
+              if (e.startsWith('/') || e.includes('..') || !allowed.has(e)) throw new Error(`Unsafe or unexpected archive entry: ${e}`);
+            }
+            for (const required of ['roles.sql','schema.sql','data.sql','manifest.json']) {
+              if (!entries.includes(required)) throw new Error(`Archive is missing ${required}.`);
+            }
+            await run('tar', ['-xzf', localBundle, '--no-same-owner', '--no-same-permissions', '-C', 'restore_work']);
+            for (const e of entries) {
+              const st = fs.lstatSync(path.join('restore_work', e));
+              if (!st.isFile()) throw new Error(`Archive entry is not a regular file: ${e}`);
+            }
+
+            const insideManifest = JSON.parse(fs.readFileSync(path.join('restore_work', 'manifest.json'), 'utf8'));
+            if (JSON.stringify(insideManifest) !== JSON.stringify(outsideManifest)) throw new Error('Inside and sidecar manifests differ.');
+            for (const [file, meta] of Object.entries(insideManifest.components || {})) {
+              const f = path.join('restore_work', file);
+              if (!fs.existsSync(f)) throw new Error(`Manifest component missing from archive: ${file}`);
+              if (sha256File(f) !== meta.sha256) throw new Error(`Component SHA-256 mismatch: ${file}`);
+            }
+            console.log(`Backup verified: ${name}; source=[${insideManifest.source_slug}]; created=${insideManifest.created_at_utc}`);
+            return { name, manifest: insideManifest };
+          }
+
+          function makeRealtimeSql(manifest) {
+            const tables = manifest.verification?.realtime_publication_tables || [];
+            const lines = ['-- Recreate Supabase Realtime publication membership captured at backup time'];
+            for (const key of tables) {
+              if (!/^[^\.]+\.[^\.]+$/.test(key)) throw new Error(`Invalid publication table in manifest: ${key}`);
+              lines.push(`ALTER PUBLICATION "supabase_realtime" ADD TABLE ${quoteQualified(key)};`);
+            }
+            fs.writeFileSync(path.join('restore_work', 'realtime.sql'), lines.join('\n') + '\n');
+          }
+
+          async function restoreIntoCleanTarget(cleanUrl, manifest) {
+            const targetExtensions = new Set(await collectExtensionNames(cleanUrl));
+            const missingExt = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !targetExtensions.has(x));
+            if (missingExt.length) throw new Error(`Clean target is missing source extensions: ${missingExt.join(', ')}. Enable them before restore.`);
+            const rt = manifest.verification?.realtime_publication_tables || [];
+            if (rt.length) {
+              const hasPub = (await psql(cleanUrl, `SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN '1' ELSE '0' END;`)) === '1';
+              if (!hasPub) throw new Error('Source uses Supabase Realtime but target has no supabase_realtime publication.');
+            }
+
+            makeRealtimeSql(manifest);
+            const baseArgs = [
+              '-X', '--single-transaction', '--variable', 'ON_ERROR_STOP=1',
+              '--file', path.resolve('restore_work/roles.sql'),
+              '--file', path.resolve('restore_work/schema.sql'),
+              '--command', 'SET session_replication_role = replica',
+              '--file', path.resolve('restore_work/data.sql')
+            ];
+            if (manifest.has_migration_history && fs.existsSync('restore_work/history_schema.sql') && fs.existsSync('restore_work/history_data.sql')) {
+              baseArgs.push('--file', path.resolve('restore_work/history_schema.sql'));
+              baseArgs.push('--file', path.resolve('restore_work/history_data.sql'));
+            }
+            if ((manifest.verification?.realtime_publication_tables || []).length) {
+              baseArgs.push('--file', path.resolve('restore_work/realtime.sql'));
+            }
+
+            console.log('Starting official logical restore pattern: psql --single-transaction + ON_ERROR_STOP=1 ...');
+            try {
+              await run('psql', baseArgs, { env: pgEnvFromUrl(cleanUrl), echoStdout: true, echoStderr: true });
+              return;
+            } catch (firstErr) {
+              const msg = safeError(firstErr);
+              const rolesPath = 'restore_work/roles.sql';
+              const schemaPath = 'restore_work/schema.sql';
+              let changed = false;
+
+              if (/permission denied to grant role\s+"?postgres"?|cli_login_postgres/i.test(msg)) {
+                const before = fs.readFileSync(rolesPath, 'utf8');
+                const after = before.split(/\r?\n/).map(line => {
+                  if (/^\s*GRANT\s+"postgres"\s+TO\s+"cli_login_postgres"/i.test(line)) {
+                    changed = true; return `-- Supabase-docs compatibility: ${line}`;
+                  }
+                  return line;
+                }).join('\n');
+                fs.writeFileSync(rolesPath, after);
+              }
+              if (/supabase_admin/i.test(msg) && /(owner|permission|must be owner)/i.test(msg)) {
+                const before = fs.readFileSync(schemaPath, 'utf8');
+                const after = before.split(/\r?\n/).map(line => {
+                  if (/^\s*ALTER\s+.+\s+OWNER\s+TO\s+"supabase_admin"\s*;/i.test(line)) {
+                    changed = true; return `-- Supabase-docs compatibility: ${line}`;
+                  }
+                  return line;
+                }).join('\n');
+                fs.writeFileSync(schemaPath, after);
+              }
+              if (!changed) throw firstErr;
+              console.warn('Retrying once after applying only Supabase-documented compatibility exceptions. First transaction was rolled back.');
+              await run('psql', baseArgs, { env: pgEnvFromUrl(cleanUrl), echoStdout: true, echoStderr: true });
+            }
+            console.log('Restore transaction COMMITTED successfully on clean target.');
+          }
+
+          async function verifyTarget(cleanUrl, manifest) {
+            const errors = [];
+            const warnings = [];
+            const expectedCounts = manifest.verification?.copy_row_counts || {};
+            for (const [key, expected] of Object.entries(expectedCounts)) {
+              const idx = key.indexOf('.');
+              const schema = idx > 0 ? key.slice(0, idx) : '';
+              const isApp = !managedSchemas.has(schema) && !schema.startsWith('pg_') && schema !== 'information_schema';
+              const isKeyManaged = ['auth.users','auth.identities','storage.buckets','storage.objects'].includes(key);
+              if (!isApp && !isKeyManaged) continue;
+              const actual = await countTable(cleanUrl, key);
+              if (actual === null) errors.push(`missing table ${key}`);
+              else if (Number(actual) !== Number(expected)) errors.push(`row count ${key}: expected=${expected}, actual=${actual}`);
+            }
+
+            const expectedManaged = manifest.verification?.managed_schema_signatures || { triggers: [], policies: [] };
+            const actualManaged = await collectManagedSignatures(cleanUrl);
+            if (JSON.stringify(actualManaged.triggers) !== JSON.stringify(expectedManaged.triggers || [])) {
+              errors.push('managed-schema trigger signatures differ (auth/storage/realtime customizations or platform baseline mismatch)');
+            }
+            if (JSON.stringify(actualManaged.policies) !== JSON.stringify(expectedManaged.policies || [])) {
+              errors.push('managed-schema policy signatures differ (auth/storage/realtime customizations or platform baseline mismatch)');
+            }
+
+            const expectedRealtime = (manifest.verification?.realtime_publication_tables || []).slice().sort();
+            const actualRealtime = (await collectRealtimeTables(cleanUrl)).slice().sort();
+            if (JSON.stringify(expectedRealtime) !== JSON.stringify(actualRealtime)) {
+              errors.push(`supabase_realtime membership differs: expected=${JSON.stringify(expectedRealtime)}, actual=${JSON.stringify(actualRealtime)}`);
+            }
+
+            const targetExt = new Set(await collectExtensionNames(cleanUrl));
+            const missingExt = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !targetExt.has(x));
+            if (missingExt.length) errors.push(`missing extensions after restore: ${missingExt.join(', ')}`);
+
+            const sourceStorageObjects = Number(manifest.verification?.storage_objects_count || 0);
+            const sourceVaultSecrets = Number(manifest.verification?.vault_secrets_count || 0);
+            const customLoginRoles = manifest.verification?.custom_login_roles || [];
+            if (sourceStorageObjects > 0 && !storageMigrated) warnings.push(`source has ${sourceStorageObjects} Storage object metadata row(s); actual object files are not in this DB backup`);
+            if (sourceVaultSecrets > 0 && !rootKeyMigrated) warnings.push(`source has ${sourceVaultSecrets} Vault secret row(s); logical restore does not include the encryption root key`);
+            if (customLoginRoles.length && !rolePasswordsConfigured) warnings.push(`custom LOGIN roles require passwords: ${customLoginRoles.join(', ')}`);
+            if (!externalSettingsConfigured) warnings.push('external Supabase project settings are not confirmed (Auth settings/API keys/Edge Functions/etc.)');
+
+            if (warnings.length) {
+              console.warn('CUTOVER BLOCKERS/WARNINGS:');
+              for (const w of warnings) console.warn(`  - ${w}`);
+            }
+            if (errors.length) {
+              console.error('VERIFICATION ERRORS:');
+              for (const e of errors) console.error(`  - ${e}`);
+              throw new Error(`Target verification failed with ${errors.length} error(s). Production was NOT changed.`);
+            }
+            console.log('Database verification PASSED.');
+            return { warnings, sourceStorageObjects, sourceVaultSecrets, customLoginRoles };
+          }
+
+          function assertCutoverReady(verification) {
+            const blockers = [];
+            if (verification.sourceStorageObjects > 0 && !storageMigrated) blockers.push('Storage object files not confirmed migrated');
+            if (verification.sourceVaultSecrets > 0 && !rootKeyMigrated) blockers.push('encryption root key/Vault not confirmed migrated');
+            if (verification.customLoginRoles.length && !rolePasswordsConfigured) blockers.push('custom LOGIN role passwords not confirmed configured');
+            if (!externalSettingsConfigured) blockers.push('external Supabase project settings not confirmed configured');
+            if (blockers.length) throw new Error(`CUTOVER BLOCKED: ${blockers.join('; ')}. Restore target remains isolated and production D1 is unchanged.`);
+          }
+
+          async function main() {
+            const { productionUrl, cleanUrl } = await loadD1Targets();
+
+            if (operation === 'rollback_swap') {
+              console.warn(`ROLLBACK SWAP requested: [${productionSlug}] <-> [${cleanTargetSlug}]`);
+              await atomicSwapD1(productionUrl, cleanUrl);
+              return;
+            }
+
+            const { manifest } = await selectAndDownloadBackup();
+            if (backupSourceSlug !== productionSlug) {
+              console.warn(`CROSS-SCHOOL RESTORE authorized: backup [${backupSourceSlug}] -> logical production [${productionSlug}] via clean target [${cleanTargetSlug}].`);
+            }
+
+            if (operation === 'restore_verify' || operation === 'restore_verify_cutover') {
+              await assertCleanTarget(cleanUrl);
+              await restoreIntoCleanTarget(cleanUrl, manifest);
+            } else {
+              console.log('verify_cutover_only: skipping restore; verifying the already-restored clean target.');
+            }
+
+            const verification = await verifyTarget(cleanUrl, manifest);
+
+            if (cutoverOps.has(operation)) {
+              assertCutoverReady(verification);
+              console.warn(`CUTOVER: D1 [${productionSlug}] will point to the verified clean target; previous production URL will move to [${cleanTargetSlug}] as rollback slot.`);
+              await atomicSwapD1(productionUrl, cleanUrl);
+            } else {
+              console.log('RESTORE+VERIFY complete. No cutover requested; production D1 remains unchanged.');
+            }
+          }
+
+          main().catch(err => {
+            console.error(`ERROR: ${safeError(err)}`);
+            process.exit(1);
+          });
+          NODE
+          node restore_bluegreen.js
+
+      - name: Cleanup local credentials and restore files
+        if: always()
+        run: |
+          set +e
+          rm -f ~/.config/rclone/rclone.conf
+          rm -rf restore_work restore_bluegreen.js
