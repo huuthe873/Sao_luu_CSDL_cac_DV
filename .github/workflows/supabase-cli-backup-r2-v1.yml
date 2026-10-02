@@ -1,4 +1,4 @@
-name: Supabase CLI Backup to Cloudflare R2 - BlueGreen v1
+name: Supabase CLI Backup to Cloudflare R2 - BlueGreen v2 orphan cleanup
 
 on:
   schedule:
@@ -25,6 +25,7 @@ concurrency:
 env:
   BACKUP_FORMAT: supabase-cli-r2-v1
   BACKUP_PREFIX: database_backups_cli
+  SAFETY_PREFIX: database_backups_cli_safety
   RETENTION_DAYS: '30'
   MIN_BACKUPS_PER_SCHOOL: '3'
   SUPABASE_CLI_VERSION: '2.117.0'
@@ -464,6 +465,8 @@ jobs:
 
           const bucket = process.env.R2_BUCKET_NAME || '';
           const prefix = process.env.BACKUP_PREFIX || 'database_backups_cli';
+          const safetyPrefix = process.env.SAFETY_PREFIX || 'database_backups_cli_safety';
+          const backupFormat = process.env.BACKUP_FORMAT || 'supabase-cli-r2-v1';
           const retentionDays = Number(process.env.RETENTION_DAYS || 30);
           const minKeep = Math.max(1, Number(process.env.MIN_BACKUPS_PER_SCHOOL || 3));
           if (!bucket) throw new Error('Missing R2_BUCKET_NAME');
@@ -520,10 +523,44 @@ jobs:
             }
           }
 
-          async function cleanupSlug(slug) {
+          async function listRemoteFiles(remoteDir) {
+            try {
+              const { stdout } = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket']);
+              return JSON.parse(stdout || '[]');
+            } catch (e) {
+              const msg = String(e.message || e);
+              if (/directory not found|object not found|not found|404/i.test(msg)) return [];
+              throw e;
+            }
+          }
+
+          function managedArtifactInfo(fileName, slug) {
+            let base = '';
+            let kind = '';
+            if (fileName.endsWith('.tar.gz.manifest.json')) {
+              base = fileName.slice(0, -'.manifest.json'.length);
+              kind = 'manifest';
+            } else if (fileName.endsWith('.tar.gz.sha256')) {
+              base = fileName.slice(0, -'.sha256'.length);
+              kind = 'sha256';
+            } else if (fileName.endsWith('.tar.gz')) {
+              base = fileName;
+              kind = 'bundle';
+            } else {
+              return null;
+            }
+
+            // Only touch artifacts created by this workflow family. This deliberately
+            // excludes unrelated .tar.gz/.sha256/.json objects that a user may keep
+            // in the same R2 folder. It also matches pre-restore safety bundles because
+            // their base name still starts with the slug and ends with the same format.
+            if (!base.startsWith(`${slug}_`) || !base.endsWith(`_${backupFormat}.tar.gz`)) return null;
+            return { base, kind };
+          }
+
+          async function cleanupCompleteRetention(slug) {
             const remoteDir = `r2:${bucket}/${prefix}/${slug}`;
-            const { stdout } = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket']);
-            const files = JSON.parse(stdout || '[]');
+            const files = await listRemoteFiles(remoteDir);
             const byName = new Map(files.map(f => [f.Path, f]));
             const bundles = files
               .filter(f => f.Path.endsWith('.tar.gz'))
@@ -538,11 +575,61 @@ jobs:
                 const remote = `${remoteDir}/${b.Path}${suffix}`;
                 try {
                   await run('rclone', ['deletefile', remote, '--s3-no-check-bucket']);
-                  console.log(`Retention deleted: ${remote}`);
+                  console.log(`Retention deleted complete-set artifact: ${remote}`);
                 } catch (e) {
                   console.warn(`Retention warning for ${remote}: ${String(e.message || e).slice(0, 1000)}`);
                 }
               }
+            }
+          }
+
+          async function cleanupOrphansInDir(remoteDir, slug, label) {
+            const files = await listRemoteFiles(remoteDir);
+            const groups = new Map();
+            for (const file of files) {
+              const info = managedArtifactInfo(String(file.Path || ''), slug);
+              if (!info) continue;
+              if (!groups.has(info.base)) groups.set(info.base, new Map());
+              groups.get(info.base).set(info.kind, file);
+            }
+
+            const cutoff = Date.now() - retentionDays * 86400 * 1000;
+            let orphanSets = 0;
+            let deletedFiles = 0;
+            for (const [base, parts] of groups) {
+              const complete = parts.has('bundle') && parts.has('sha256') && parts.has('manifest');
+              if (complete) continue;
+
+              // Safety rule: use the NEWEST timestamp among the surviving pieces.
+              // The set is deleted only when every existing piece is older than the
+              // retention window, so an upload currently in progress can never qualify.
+              const times = [...parts.values()]
+                .map(f => new Date(f.ModTime).getTime())
+                .filter(Number.isFinite);
+              if (!times.length) {
+                console.warn(`Orphan cleanup skipped [${label}] ${base}: no valid ModTime.`);
+                continue;
+              }
+              const newest = Math.max(...times);
+              if (newest >= cutoff) continue;
+
+              orphanSets++;
+              const orderedKinds = ['manifest', 'sha256', 'bundle'];
+              for (const kind of orderedKinds) {
+                const file = parts.get(kind);
+                if (!file) continue;
+                const remote = `${remoteDir}/${file.Path}`;
+                try {
+                  await run('rclone', ['deletefile', remote, '--s3-no-check-bucket']);
+                  deletedFiles++;
+                  console.log(`Orphan cleanup deleted [${label}]: ${remote}`);
+                } catch (e) {
+                  console.warn(`Orphan cleanup warning [${label}] for ${remote}: ${String(e.message || e).slice(0, 1000)}`);
+                }
+              }
+            }
+            if (orphanSets || deletedFiles) {
+              console.log(`Orphan cleanup summary [${label}] [${slug}]: sets=${orphanSets}, files_deleted=${deletedFiles}`);
             }
           }
 
@@ -556,10 +643,36 @@ jobs:
                 successfulSlugs.add(item.slug);
               } else uploadFail++;
             }
+            // Preserve the existing complete-backup retention policy exactly:
+            // only a slug with a newly verified upload is allowed to age out old
+            // COMPLETE sets. This prevents a failed backup run from reducing recovery depth.
             for (const slug of successfulSlugs) {
-              try { await cleanupSlug(slug); }
-              catch (e) { console.warn(`Cleanup warning [${slug}]: ${String(e.message || e).slice(0, 3000)}`); }
+              try { await cleanupCompleteRetention(slug); }
+              catch (e) { console.warn(`Complete-set cleanup warning [${slug}]: ${String(e.message || e).slice(0, 3000)}`); }
             }
+
+            // Orphan files are not valid restore points, so they may be cleaned even
+            // when today's backup for that slug failed. Limit this to slugs present in
+            // the current D1-driven report, require age > RETENTION_DAYS, and only touch
+            // files that match this workflow's exact backup naming family.
+            const knownSlugs = new Set([
+              ...(report.results || []).map(x => String(x.slug || '')),
+              ...(report.failures || []).map(x => String(x.slug || ''))
+            ].filter(x => /^[A-Za-z0-9_-]+$/.test(x)));
+
+            for (const slug of knownSlugs) {
+              try {
+                await cleanupOrphansInDir(`r2:${bucket}/${prefix}/${slug}`, slug, 'main');
+              } catch (e) {
+                console.warn(`Orphan cleanup warning [main] [${slug}]: ${String(e.message || e).slice(0, 3000)}`);
+              }
+              try {
+                await cleanupOrphansInDir(`r2:${bucket}/${safetyPrefix}/${slug}`, slug, 'safety');
+              } catch (e) {
+                console.warn(`Orphan cleanup warning [safety] [${slug}]: ${String(e.message || e).slice(0, 3000)}`);
+              }
+            }
+
             console.log(`R2 summary: uploaded_verified=${uploadOk}, upload_failed=${uploadFail}, backup_generation_failed=${(report.failures || []).length}`);
             if (uploadFail > 0 || (report.failures || []).length > 0) process.exit(1);
           }
