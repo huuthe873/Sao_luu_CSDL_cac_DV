@@ -1,4 +1,4 @@
-name: Supabase CLI Restore Direct v5 - safe in-place sequences
+name: Supabase CLI Restore Direct v6 - transactional compatibility restore
 
 on:
   workflow_dispatch:
@@ -93,7 +93,7 @@ jobs:
           INPUT_BACKUP_FILE: ${{ github.event.inputs.backup_file }}
         run: |
           set -euo pipefail
-          cat > restore_direct_v5.js <<'NODE'
+          cat > restore_direct_v6.js <<'NODE'
           const fs = require('fs');
           const path = require('path');
           const crypto = require('crypto');
@@ -246,6 +246,101 @@ jobs:
               names.push(`${schema}.${table}`);
             }
             return [...new Set(names)].sort();
+          }
+
+          function splitSqlIdentifierList(text) {
+            const out = [];
+            let cur = '', quoted = false;
+            for (let i = 0; i < text.length; i++) {
+              const ch = text[i];
+              if (ch === '"') {
+                cur += ch;
+                if (quoted && text[i + 1] === '"') { cur += '"'; i++; continue; }
+                quoted = !quoted;
+                continue;
+              }
+              if (ch === ',' && !quoted) { out.push(cur.trim()); cur = ''; continue; }
+              cur += ch;
+            }
+            if (cur.trim()) out.push(cur.trim());
+            if (quoted) throw new Error(`Unterminated quoted identifier list: ${text}`);
+            return out;
+          }
+
+          function unquoteIdentifier(raw) {
+            const v = String(raw || '').trim();
+            if (/^"(?:[^"]|"")+"$/.test(v)) return v.slice(1, -1).replace(/""/g, '"');
+            return v;
+          }
+
+          function parseCopyLayouts(dataFile) {
+            const lines = fs.readFileSync(dataFile, 'utf8').split(/\r?\n/);
+            const layouts = new Map();
+            for (const line of lines) {
+              const m = line.match(/^COPY\s+(.+?)\s+\((.*)\)\s+FROM stdin;$/);
+              if (!m) continue;
+              const [schema, table] = parseQualifiedName(m[1]);
+              if (!schema || !table) throw new Error(`Invalid COPY target: ${m[1]}`);
+              const cols = splitSqlIdentifierList(m[2]).map(unquoteIdentifier);
+              const key = `${schema}.${table}`;
+              const old = layouts.get(key);
+              if (old && JSON.stringify(old) !== JSON.stringify(cols)) throw new Error(`Backup contains inconsistent COPY layouts for ${key}.`);
+              layouts.set(key, cols);
+            }
+            return layouts;
+          }
+
+          function sqlLiteral(value) { return "'" + String(value).replace(/'/g, "''") + "'"; }
+
+          async function getTargetColumnMeta(dbUrl, key) {
+            const q = sqlLiteral(key);
+            const out = await psql(dbUrl, `
+              SELECT COALESCE(json_agg(json_build_object(
+                'name', a.attname,
+                'type', format_type(a.atttypid, a.atttypmod),
+                'not_null', a.attnotnull,
+                'has_default', ad.oid IS NOT NULL,
+                'generated', a.attgenerated,
+                'identity', a.attidentity
+              ) ORDER BY a.attnum)::text, '[]')
+              FROM pg_attribute a
+              LEFT JOIN pg_attrdef ad ON ad.adrelid=a.attrelid AND ad.adnum=a.attnum
+              WHERE a.attrelid=to_regclass(${q}) AND a.attnum>0 AND NOT a.attisdropped;`);
+            try { return JSON.parse(out || '[]'); }
+            catch (_) { throw new Error(`Could not parse target column metadata for ${key}.`); }
+          }
+
+          async function preflightExistingDataCompatibility(dbUrl, files) {
+            const merged = new Map();
+            for (const file of files.filter(Boolean)) {
+              if (!fs.existsSync(file)) continue;
+              for (const [key, cols] of parseCopyLayouts(file)) {
+                const old = merged.get(key);
+                if (old && JSON.stringify(old) !== JSON.stringify(cols)) throw new Error(`Backup has conflicting COPY column layouts for ${key}.`);
+                merged.set(key, cols);
+              }
+            }
+            if (!merged.size) throw new Error('Backup contains no COPY table layout; refusing in-place destructive restore.');
+
+            const errors = [], warnings = [];
+            for (const [key, backupCols] of [...merged.entries()].sort(([a],[b]) => a.localeCompare(b))) {
+              if (!(await relationExists(dbUrl, key))) { errors.push(`${key}: target table does not exist`); continue; }
+              const meta = await getTargetColumnMeta(dbUrl, key);
+              const byName = new Map(meta.map(x => [x.name, x]));
+              const missing = backupCols.filter(c => !byName.has(c));
+              if (missing.length) errors.push(`${key}: missing target column(s): ${missing.join(', ')}`);
+
+              const generatedInCopy = backupCols.filter(c => byName.get(c)?.generated);
+              if (generatedInCopy.length) errors.push(`${key}: backup COPY includes generated target column(s): ${generatedInCopy.join(', ')}`);
+
+              const backupSet = new Set(backupCols);
+              const requiredExtra = meta.filter(c => !backupSet.has(c.name) && c.not_null && !c.has_default && !c.generated && !c.identity);
+              if (requiredExtra.length) errors.push(`${key}: target has required column(s) absent from backup COPY and without default: ${requiredExtra.map(x => x.name).join(', ')}`);
+
+              const extra = meta.filter(c => !backupSet.has(c.name));
+              if (extra.length) warnings.push(`${key}: target has ${extra.length} extra column(s); PostgreSQL transaction will validate defaults/constraints while loading`);
+            }
+            return { layouts: merged, errors, warnings };
           }
 
           function parseCopyCounts(dataFile) {
@@ -561,11 +656,14 @@ jobs:
             await ensureExtensions(dbUrl, manifest);
             const realtimeFile = path.resolve('restore_work/realtime.sql');
             await makeRealtimeSql(manifest, dbUrl, realtimeFile);
+            const rolesPath = 'restore_work/roles.sql';
+            const schemaPath = 'restore_work/schema.sql';
+
             const buildArgs = () => {
               const args = [
                 '-X','--single-transaction','--variable','ON_ERROR_STOP=1',
-                '--file',path.resolve('restore_work/roles.sql'),
-                '--file',path.resolve('restore_work/schema.sql'),
+                '--file',path.resolve(rolesPath),
+                '--file',path.resolve(schemaPath),
                 '--command','SET session_replication_role = replica',
                 '--file',path.resolve('restore_work/data.sql')
               ];
@@ -576,39 +674,54 @@ jobs:
               return args;
             };
 
-            try {
-              await run('psql', buildArgs(), { env: pgEnvFromUrl(dbUrl), echoStdout: true, echoStderr: true });
-              return;
-            } catch (firstErr) {
-              const msg = safeError(firstErr);
-              const rolesPath = 'restore_work/roles.sql';
-              const schemaPath = 'restore_work/schema.sql';
-              let changed = false;
+            function commentMatchingLines(file, matcher, reason) {
+              const before = fs.readFileSync(file, 'utf8');
+              let changed = 0;
+              const after = before.split(/\r?\n/).map(line => {
+                if (!/^\s*--/.test(line) && matcher(line)) {
+                  changed++;
+                  return `-- v6 compatibility (${reason}): ${line}`;
+                }
+                return line;
+              }).join('\n');
+              if (changed) fs.writeFileSync(file, after);
+              return changed;
+            }
 
+            function patchCompatibilityError(msg) {
+              let changed = 0;
+              const pm = msg.match(/permission denied for parameter\s+["']?([A-Za-z0-9_.-]+)["']?/i);
+              if (pm) {
+                const param = pm[1];
+                const esc = param.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const rx = new RegExp(`^\\s*ALTER\\s+(?:ROLE|USER)\\b.*\\b(?:SET|RESET)\\s+"?${esc}"?(?:\\s|=|;|$)`, 'i');
+                changed += commentMatchingLines(rolesPath, line => rx.test(line), `target forbids role parameter ${param}`);
+              }
               if (/permission denied to grant role\s+"?postgres"?|cli_login_postgres/i.test(msg)) {
-                const before = fs.readFileSync(rolesPath, 'utf8');
-                const after = before.split(/\r?\n/).map(line => {
-                  if (/^\s*GRANT\s+"postgres"\s+TO\s+"cli_login_postgres"/i.test(line)) {
-                    changed = true; return `-- Supabase documented compatibility: ${line}`;
-                  }
-                  return line;
-                }).join('\n');
-                fs.writeFileSync(rolesPath, after);
+                changed += commentMatchingLines(rolesPath, line => /^\s*GRANT\s+"?postgres"?\s+TO\s+"?cli_login_postgres"?/i.test(line), 'reserved Supabase role grant');
               }
               if (/supabase_admin/i.test(msg) && /(owner|permission|must be owner)/i.test(msg)) {
-                const before = fs.readFileSync(schemaPath, 'utf8');
-                const after = before.split(/\r?\n/).map(line => {
-                  if (/^\s*ALTER\s+.+\s+OWNER\s+TO\s+"supabase_admin"\s*;/i.test(line)) {
-                    changed = true; return `-- Supabase documented compatibility: ${line}`;
-                  }
-                  return line;
-                }).join('\n');
-                fs.writeFileSync(schemaPath, after);
+                changed += commentMatchingLines(schemaPath, line => /^\s*ALTER\s+.+\s+OWNER\s+TO\s+"?supabase_admin"?\s*;/i.test(line), 'Supabase-managed owner');
               }
-              if (!changed) throw firstErr;
-              console.warn('First clean-target restore transaction rolled back. Retrying once after Supabase-documented compatibility filtering.');
-              await run('psql', buildArgs(), { env: pgEnvFromUrl(dbUrl), echoStdout: true, echoStderr: true });
+              return changed;
             }
+
+            let lastErr;
+            for (let attempt = 1; attempt <= 8; attempt++) {
+              try {
+                console.log(`Clean-target restore transaction attempt ${attempt}/8 ...`);
+                await run('psql', buildArgs(), { env: pgEnvFromUrl(dbUrl), echoStdout: true, echoStderr: true });
+                console.log('Clean-target full logical restore COMMITTED successfully.');
+                return;
+              } catch (err) {
+                lastErr = err;
+                const msg = safeError(err);
+                const changed = patchCompatibilityError(msg);
+                if (!changed || attempt === 8) throw err;
+                console.warn(`Restore transaction rolled back. Applied ${changed} narrowly-scoped Supabase compatibility patch(es); retrying.`);
+              }
+            }
+            throw lastErr;
           }
 
           async function restoreExistingCompatibleTarget(dbUrl, manifest, currentSchemaFile) {
@@ -617,29 +730,32 @@ jobs:
             console.log(`Schema fingerprint backup=${backupFp}`);
             console.log(`Schema fingerprint target=${currentFp}`);
             if (backupFp !== currentFp) {
-              throw new Error(
-                'Existing target schema is NOT identical to the selected backup schema. ' +
-                'For safety, in-place schema replacement is refused. If the database is badly damaged, create a NEW empty Supabase project/database, update D1 supabase_sql for this same suffix, then run this workflow again.'
-              );
+              console.warn('Schema dump fingerprints differ. v6 does NOT treat a raw schema.sql hash mismatch as proof of incompatibility because separate Supabase projects can produce different dump text for platform/environment details.');
+              console.warn('v6 will instead run a structural COPY-column preflight, then let PostgreSQL validate the actual data load inside one transaction. Any incompatibility causes a full rollback.');
+            } else {
+              console.log('Schema dump fingerprints are identical.');
             }
 
-            const tables = parseCopyTableNames('restore_work/data.sql');
-            if (manifest.has_migration_history && fs.existsSync('restore_work/history_data.sql')) {
-              tables.push(...parseCopyTableNames('restore_work/history_data.sql'));
+            const historyData = manifest.has_migration_history && fs.existsSync('restore_work/history_data.sql')
+              ? 'restore_work/history_data.sql' : null;
+            const preflight = await preflightExistingDataCompatibility(dbUrl, ['restore_work/data.sql', historyData]);
+            for (const w of preflight.warnings) console.warn(`COMPAT WARNING: ${w}`);
+            if (preflight.errors.length) {
+              for (const e of preflight.errors) console.error(`COMPAT ERROR: ${e}`);
+              throw new Error(`Existing target is structurally incompatible with this backup (${preflight.errors.length} hard incompatibility error(s)). No target data was changed. Use a clean/new Supabase project for a full schema+data restore.`);
             }
-            const uniqueTables = [...new Set(tables)].sort();
+            console.log(`Structural COPY preflight PASSED for ${preflight.layouts.size} table(s).`);
+
+            const uniqueTables = [...preflight.layouts.keys()].sort();
             for (const key of uniqueTables) {
               if (!(await relationExists(dbUrl, key))) throw new Error(`Target schema is missing table required by backup data: ${key}`);
             }
-            if (!uniqueTables.length) throw new Error('Backup contains no COPY tables; refusing in-place destructive restore.');
 
-            // IMPORTANT for an existing Supabase project:
-            // Do NOT use RESTART IDENTITY here. Supabase-managed sequences (for example
-            // auth.refresh_tokens_id_seq) are owned by reserved service roles, so the
-            // normal postgres connection may TRUNCATE the table but is not allowed to
-            // ALTER/RESTART the managed sequence. CONTINUE IDENTITY is also safer for
-            // a rollback to an older snapshot because sequence high-water marks are
-            // preserved instead of being moved backwards.
+            // Existing-target restore is intentionally DATA-ONLY. It preserves the
+            // target schema and restores the selected snapshot's rows. If schema.sql
+            // differs, the safety backup plus single PostgreSQL transaction protect
+            // the target: COPY/constraints/types are validated by PostgreSQL itself.
+            // For an exact schema rollback, restore to a clean/new Supabase project.
             const truncateSql = [
               "SET lock_timeout = '30s';",
               "SET statement_timeout = '0';",
@@ -648,19 +764,13 @@ jobs:
             ].join('\n') + '\n';
             fs.writeFileSync('restore_work/truncate.sql', truncateSql);
 
-            // pg_dump data-only files can contain SELECT pg_catalog.setval(...).
-            // During an in-place rollback we intentionally preserve the target's
-            // current sequence high-water marks. This avoids permission errors on
-            // Supabase-managed sequences and prevents an older backup from moving a
-            // live sequence backwards. Clean/new-project restore still uses the
-            // original data.sql unchanged.
             function makeInPlaceDataFile(inputFile, outputFile) {
               const lines = fs.readFileSync(inputFile, 'utf8').split(/\r?\n/);
               let removed = 0;
               const out = lines.map(line => {
                 if (/^\s*SELECT\s+pg_catalog\.setval\s*\(/i.test(line)) {
                   removed++;
-                  return `-- in-place restore v5: preserved target sequence state; skipped: ${line}`;
+                  return `-- in-place restore v6: preserved target sequence state; skipped: ${line}`;
                 }
                 return line;
               });
@@ -671,9 +781,9 @@ jobs:
             const inPlaceData = path.resolve('restore_work/data_inplace.sql');
             let skippedSetvals = makeInPlaceDataFile('restore_work/data.sql', inPlaceData);
             let inPlaceHistoryData = null;
-            if (manifest.has_migration_history && fs.existsSync('restore_work/history_data.sql')) {
+            if (historyData) {
               inPlaceHistoryData = path.resolve('restore_work/history_data_inplace.sql');
-              skippedSetvals += makeInPlaceDataFile('restore_work/history_data.sql', inPlaceHistoryData);
+              skippedSetvals += makeInPlaceDataFile(historyData, inPlaceHistoryData);
             }
             console.log(`In-place sequence protection: CONTINUE IDENTITY; skipped ${skippedSetvals} pg_dump setval statement(s).`);
 
@@ -695,17 +805,23 @@ jobs:
             for (let attempt = 1; attempt <= 4; attempt++) {
               await terminateClientSessions(dbUrl);
               try {
-                console.log(`In-place data restore attempt ${attempt}/4 ...`);
+                console.log(`In-place transactional data restore attempt ${attempt}/4 ...`);
                 await run('psql', args, { env: pgEnvFromUrl(dbUrl), echoStdout: true, echoStderr: true });
                 console.log('In-place data restore COMMITTED successfully.');
+                if (backupFp !== currentFp) {
+                  console.warn('IMPORTANT: data was restored successfully into the CURRENT target schema. The target schema itself was not rolled back to the backup schema. For exact schema+data restoration, use a clean/new target.');
+                }
                 return;
               } catch (err) {
                 lastErr = err;
                 const msg = safeError(err);
-                if (!/(deadlock detected|lock timeout|could not obtain lock|canceling statement due to lock timeout)/i.test(msg) || attempt === 4) throw err;
-                const wait = [5, 10, 20, 30][attempt - 1];
-                console.warn(`Lock contention detected; transaction rolled back. Retrying in ${wait}s.`);
-                await sleep(wait * 1000);
+                if (/(deadlock detected|lock timeout|could not obtain lock|canceling statement due to lock timeout)/i.test(msg) && attempt < 4) {
+                  const wait = [5, 10, 20, 30][attempt - 1];
+                  console.warn(`Lock contention detected; transaction rolled back. Retrying in ${wait}s.`);
+                  await sleep(wait * 1000);
+                  continue;
+                }
+                throw new Error(`Existing-target restore was rejected by PostgreSQL and fully rolled back. This normally means the current schema/data constraints are not compatible with the selected backup. Original error: ${msg}`);
               }
             }
             throw lastErr;
@@ -767,7 +883,7 @@ jobs:
               await restoreCleanTarget(target.dbUrl, manifest);
             } else {
               console.log(`Target already contains data: ${state.dirty.join(', ')}`);
-              console.log('Existing-target mode: safety backup -> schema compatibility check -> transactional data rollback.');
+              console.log('Existing-target mode: safety backup -> structural COPY compatibility preflight -> transactional data rollback.');
               const safety = await createSafetyBackup(target.dbUrl);
               await restoreExistingCompatibleTarget(target.dbUrl, manifest, safety.currentSchemaFile);
             }
@@ -782,11 +898,11 @@ jobs:
             process.exit(1);
           });
           NODE
-          node restore_direct_v5.js
+          node restore_direct_v6.js
 
       - name: Cleanup local credentials and work files
         if: always()
         run: |
           set +e
           rm -f ~/.config/rclone/rclone.conf
-          rm -rf restore_work safety_work restore_direct_v5.js
+          rm -rf restore_work safety_work restore_direct_v6.js
