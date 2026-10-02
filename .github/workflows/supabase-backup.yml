@@ -1,4 +1,4 @@
-name: sao_luu_moi_nhat
+name: sao_luu_moi_nhat_02.10
 
 on:
   schedule:
@@ -19,23 +19,20 @@ permissions:
   contents: read
 
 concurrency:
-  group: supabase-db-bluegreen-${{ github.repository }}
+  group: supabase-db-maintenance-${{ github.repository }}
   cancel-in-progress: false
 
 env:
   BACKUP_FORMAT: supabase-cli-r2-v1
   BACKUP_PREFIX: database_backups
-  SAFETY_PREFIX: database_backups_safety
   RETENTION_DAYS: '30'
   MIN_BACKUPS_PER_SCHOOL: '3'
-  SAFETY_RETENTION_DAYS: '30'
-  MIN_SAFETY_BACKUPS_PER_SCHOOL: '3'
   SUPABASE_CLI_VERSION: '2.117.0'
 
 jobs:
   backup:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
@@ -55,12 +52,25 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y postgresql-client curl ca-certificates
-          curl -fsSL https://rclone.org/install.sh | sudo bash
+          sudo apt-get install -y curl ca-certificates
+
+          # Pin PostgreSQL client 17 to the same major version used by the Supabase dump image.
+          sudo install -d -m 0755 /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          sudo sh -c "printf '%s\n' 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+          # Avoid curl|bash and rclone|head pipelines under set -o pipefail.
+          curl -fsSL https://rclone.org/install.sh -o /tmp/install-rclone.sh
+          sudo bash /tmp/install-rclone.sh
+          rm -f /tmp/install-rclone.sh
+
           docker info >/dev/null
           supabase --version
           psql --version
-          rclone version | head -n 1
+          rclone version
 
       - name: Configure Cloudflare R2
         env:
@@ -181,9 +191,38 @@ jobs:
             return block.results || [];
           }
 
-          function pgEnvFromUrl(dbUrl) {
+          function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+          let maintenanceRouteLogged = false;
+
+          function maintenanceDbUrl(dbUrl) {
             const u = new URL(dbUrl);
             if (!['postgres:', 'postgresql:'].includes(u.protocol)) throw new Error('Invalid PostgreSQL URL protocol.');
+
+            // Supabase shared pooler: 6543 = transaction mode, 5432 = session mode.
+            // Long-running dump/maintenance work uses session mode to avoid transaction-pooler limits.
+            if (u.hostname.endsWith('.pooler.supabase.com') && u.port === '6543') {
+              u.port = '5432';
+              if (!maintenanceRouteLogged) {
+                console.log('MAINTENANCE CONNECTION: detected Supabase shared transaction pooler :6543; using session pooler :5432 for backup/dump traffic.');
+                maintenanceRouteLogged = true;
+              }
+            }
+            if (!u.searchParams.has('sslmode')) u.searchParams.set('sslmode', 'require');
+            if (!u.searchParams.has('connect_timeout')) u.searchParams.set('connect_timeout', '30');
+            if (!u.searchParams.has('keepalives')) u.searchParams.set('keepalives', '1');
+            if (!u.searchParams.has('keepalives_idle')) u.searchParams.set('keepalives_idle', '30');
+            if (!u.searchParams.has('keepalives_interval')) u.searchParams.set('keepalives_interval', '10');
+            if (!u.searchParams.has('keepalives_count')) u.searchParams.set('keepalives_count', '5');
+            return u.toString();
+          }
+
+          function isTransientPgConnectionError(text) {
+            return /(SSL error:\s*unexpected eof|server closed the connection unexpectedly|connection reset by peer|broken pipe|connection timed out|timeout expired|could not receive data from server|could not send data to server|terminating connection due to administrator command|the database system is starting up|cannot connect now|network is unreachable|no route to host|temporary failure in name resolution|i\/o timeout|TLS handshake timeout)/i.test(String(text || ''));
+          }
+
+          function pgEnvFromUrl(dbUrl) {
+            const u = new URL(maintenanceDbUrl(dbUrl));
             const dbName = decodeURIComponent((u.pathname || '/postgres').replace(/^\//, '')) || 'postgres';
             return {
               ...process.env,
@@ -193,15 +232,56 @@ jobs:
               PGPASSWORD: decodeURIComponent(u.password),
               PGDATABASE: dbName,
               PGSSLMODE: u.searchParams.get('sslmode') || 'require',
-              PGCONNECT_TIMEOUT: '20'
+              PGCONNECT_TIMEOUT: '30',
+              PGKEEPALIVES: '1',
+              PGKEEPALIVESIDLE: '30',
+              PGKEEPALIVESINTERVAL: '10',
+              PGKEEPALIVESCOUNT: '5',
+              PGAPPNAME: 'supabase-backup'
             };
           }
 
           async function psql(dbUrl, sql, fieldSep = '\t') {
-            const { stdout } = await run('psql', [
-              '-X', '-v', 'ON_ERROR_STOP=1', '-A', '-t', '-F', fieldSep, '-c', sql
-            ], { env: pgEnvFromUrl(dbUrl), echoStderr: false });
-            return stdout.trim();
+            let lastErr;
+            for (let attempt = 1; attempt <= 4; attempt++) {
+              try {
+                const { stdout } = await run('psql', [
+                  '-X', '-v', 'ON_ERROR_STOP=1', '-A', '-t', '-F', fieldSep, '-c', sql
+                ], { env: pgEnvFromUrl(dbUrl), echoStderr: false });
+                return stdout.trim();
+              } catch (err) {
+                lastErr = err;
+                const msg = safeError(err);
+                if (!isTransientPgConnectionError(msg) || attempt === 4) throw err;
+                const wait = [2, 5, 10][attempt - 1] || 10;
+                console.warn(`Transient PostgreSQL connection error during backup query (attempt ${attempt}/4). Retrying in ${wait}s: ${msg.split('\n')[0]}`);
+                await sleep(wait * 1000);
+              }
+            }
+            throw lastErr;
+          }
+
+          async function dumpWithRetry(dbUrl, outputFile, extraArgs, label) {
+            const maintenanceUrl = maintenanceDbUrl(dbUrl);
+            let lastErr;
+            for (let attempt = 1; attempt <= 4; attempt++) {
+              fs.rmSync(outputFile, { force: true });
+              try {
+                const result = await run('supabase', ['db', 'dump', '--db-url', maintenanceUrl, '-f', outputFile, ...extraArgs], { echoStdout: true, echoStderr: false });
+                if (result.stderr && result.stderr.trim()) console.warn(`${label} diagnostic: ${safeError({ stderr: result.stderr })}`);
+                if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size === 0) throw new Error(`${label} produced an empty dump file.`);
+                return;
+              } catch (err) {
+                lastErr = err;
+                fs.rmSync(outputFile, { force: true });
+                const msg = safeError(err);
+                if (!isTransientPgConnectionError(msg) || attempt === 4) throw err;
+                const wait = [5, 10, 20][attempt - 1] || 20;
+                console.warn(`Transient connection error during ${label} (attempt ${attempt}/4). Retrying in ${wait}s.`);
+                await sleep(wait * 1000);
+              }
+            }
+            throw lastErr;
           }
 
           async function relationExists(dbUrl, regclass) {
@@ -219,7 +299,14 @@ jobs:
 
           function sha256File(file) {
             const h = crypto.createHash('sha256');
-            h.update(fs.readFileSync(file));
+            const fd = fs.openSync(file, 'r');
+            const buf = Buffer.allocUnsafe(1024 * 1024);
+            try {
+              let n;
+              while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
+            } finally {
+              fs.closeSync(fd);
+            }
             return h.digest('hex');
           }
 
@@ -231,30 +318,35 @@ jobs:
             return ['public', raw.replace(/^"|"$/g, '')];
           }
 
-          function parseCopyCounts(dataFile) {
-            const text = fs.readFileSync(dataFile, 'utf8');
-            const lines = text.split(/\r?\n/);
+          async function parseCopyCounts(dataFile) {
+            const readline = require('readline');
+            const input = fs.createReadStream(dataFile, { encoding: 'utf8', highWaterMark: 1024 * 1024 });
+            const rl = readline.createInterface({ input, crlfDelay: Infinity });
             const counts = {};
             let current = null;
             let count = 0;
-            for (const line of lines) {
-              if (!current) {
-                const m = line.match(/^COPY\s+(.+?)\s+\(.+\)\s+FROM stdin;$/);
-                if (m) {
-                  current = m[1];
+            try {
+              for await (const line of rl) {
+                if (!current) {
+                  const m = line.match(/^COPY\s+(.+?)\s+\(.+\)\s+FROM stdin;$/);
+                  if (m) {
+                    current = m[1];
+                    count = 0;
+                  }
+                } else if (line === '\\.') {
+                  const [schema, table] = parseQualifiedName(current);
+                  const key = `${schema}.${table}`;
+                  const isApp = !managedSchemas.has(schema) && !schema.startsWith('pg_') && schema !== 'information_schema';
+                  const isKeyManaged = ['auth.users', 'auth.identities', 'storage.buckets', 'storage.objects'].includes(key);
+                  if (isApp || isKeyManaged) counts[key] = count;
+                  current = null;
                   count = 0;
+                } else {
+                  count++;
                 }
-              } else if (line === '\\.') {
-                const [schema, table] = parseQualifiedName(current);
-                const key = `${schema}.${table}`;
-                const isApp = !managedSchemas.has(schema) && !schema.startsWith('pg_') && schema !== 'information_schema';
-                const isKeyManaged = ['auth.users', 'auth.identities', 'storage.buckets', 'storage.objects'].includes(key);
-                if (isApp || isKeyManaged) counts[key] = count;
-                current = null;
-                count = 0;
-              } else {
-                count++;
               }
+            } finally {
+              rl.close();
             }
             if (current) throw new Error('data.sql ended inside a COPY block.');
             return Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
@@ -306,14 +398,27 @@ jobs:
             return [...names].sort();
           }
 
+          function vietnamFileStamp(date = new Date()) {
+            // Short operator-friendly filename time in Vietnam local time (UTC+7):
+            // HH-MM-SS_DD-MM-YYYY, e.g. 05-08-09_12-09-2026.
+            const parts = new Intl.DateTimeFormat('en-GB', {
+              timeZone: 'Asia/Ho_Chi_Minh',
+              year: 'numeric', month: '2-digit', day: '2-digit',
+              hour: '2-digit', minute: '2-digit', second: '2-digit',
+              hourCycle: 'h23'
+            }).formatToParts(date);
+            const p = Object.fromEntries(parts.filter(x => x.type !== 'literal').map(x => [x.type, x.value]));
+            return `${p.hour}-${p.minute}-${p.second}_${p.day}-${p.month}-${p.year}`;
+          }
+
           async function backupOne(row) {
             const slug = String(row.slug || '').trim();
             const dbUrl = String(row.supabase_sql || '').trim();
             if (!/^[A-Za-z0-9_-]+$/.test(slug)) throw new Error(`Invalid slug from D1: ${slug}`);
             if (!dbUrl) throw new Error(`[${slug}] Missing supabase_sql.`);
 
-            const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
-            const base = `${slug}_${stamp}_${backupFormat}`;
+            const stamp = vietnamFileStamp();
+            const base = `${slug}_${stamp}`;
             const dir = path.join('backups_cli', slug, base);
             fs.mkdirSync(dir, { recursive: true });
 
@@ -328,9 +433,9 @@ jobs:
             const shaFile = `${bundle}.sha256`;
 
             console.log(`\n=== BACKUP [${slug}] ===`);
-            await run('supabase', ['db', 'dump', '--db-url', dbUrl, '-f', roles, '--role-only'], { echoStdout: true });
-            await run('supabase', ['db', 'dump', '--db-url', dbUrl, '-f', schema], { echoStdout: true });
-            await run('supabase', ['db', 'dump', '--db-url', dbUrl, '-f', data, '--use-copy', '--data-only', '-x', 'storage.buckets_vectors', '-x', 'storage.vector_indexes'], { echoStdout: true });
+            await dumpWithRetry(dbUrl, roles, ['--role-only'], `[${slug}] roles dump`);
+            await dumpWithRetry(dbUrl, schema, [], `[${slug}] schema dump`);
+            await dumpWithRetry(dbUrl, data, ['--use-copy', '--data-only', '-x', 'storage.buckets_vectors', '-x', 'storage.vector_indexes'], `[${slug}] data dump`);
 
             for (const f of [roles, schema, data]) {
               if (!fs.existsSync(f) || fs.statSync(f).size === 0) throw new Error(`[${slug}] Empty dump component: ${path.basename(f)}`);
@@ -339,8 +444,8 @@ jobs:
             let hasMigrationHistory = false;
             if (await relationExists(dbUrl, 'supabase_migrations.schema_migrations')) {
               try {
-                await run('supabase', ['db', 'dump', '--db-url', dbUrl, '-f', histSchema, '--schema', 'supabase_migrations'], { echoStdout: true });
-                await run('supabase', ['db', 'dump', '--db-url', dbUrl, '-f', histData, '--use-copy', '--data-only', '--schema', 'supabase_migrations'], { echoStdout: true });
+                await dumpWithRetry(dbUrl, histSchema, ['--schema', 'supabase_migrations'], `[${slug}] migration schema dump`);
+                await dumpWithRetry(dbUrl, histData, ['--use-copy', '--data-only', '--schema', 'supabase_migrations'], `[${slug}] migration data dump`);
                 hasMigrationHistory = fs.existsSync(histSchema) && fs.existsSync(histData) && fs.statSync(histSchema).size > 0;
               } catch (e) {
                 console.warn(`[${slug}] WARNING: Could not preserve migration history: ${safeError(e)}`);
@@ -348,16 +453,27 @@ jobs:
               }
             }
 
-            const copyCounts = parseCopyCounts(data);
+            const copyCounts = await parseCopyCounts(data);
             const managed = await collectManagedSignatures(dbUrl);
             const extensions = await collectExtensions(dbUrl);
             const realtimeTables = await collectRealtimeTables(dbUrl);
             const serverVersion = await psql(dbUrl, 'SHOW server_version;');
+            const databaseSizeBytes = Number(await psql(dbUrl, 'SELECT pg_database_size(current_database())::bigint;') || 0);
             const storageObjectsLive = await safeCount(dbUrl, 'storage.objects');
             const storageBucketsLive = await safeCount(dbUrl, 'storage.buckets');
             const vaultSecrets = await safeCount(dbUrl, 'vault.secrets');
             const authUsersLive = await safeCount(dbUrl, 'auth.users');
             const authIdentitiesLive = await safeCount(dbUrl, 'auth.identities');
+
+            // Hard coverage gate: if these critical Supabase tables exist, data.sql must contain
+            // a COPY block for them (even when the table is empty). This prevents publishing a
+            // backup that silently omitted Auth/Storage metadata because of a dump/filter change.
+            for (const key of ['auth.users', 'auth.identities', 'storage.buckets', 'storage.objects']) {
+              if (await relationExists(dbUrl, key) && !Object.prototype.hasOwnProperty.call(copyCounts, key)) {
+                throw new Error(`[${slug}] Backup integrity failure: data.sql does not contain required COPY block for ${key}. Backup will NOT be published.`);
+              }
+            }
+
             // Prefer counts parsed from data.sql because they describe the exact data dump snapshot.
             const authUsers = copyCounts['auth.users'] ?? authUsersLive;
             const authIdentities = copyCounts['auth.identities'] ?? authIdentitiesLive;
@@ -375,8 +491,11 @@ jobs:
               format_version: 1,
               source_slug: slug,
               created_at_utc: new Date().toISOString(),
+              filename_timestamp: stamp,
+              filename_timezone: 'Asia/Ho_Chi_Minh',
               supabase_cli_version: process.env.SUPABASE_CLI_VERSION || 'unknown',
               postgres_server_version: serverVersion,
+              database_size_bytes: databaseSizeBytes,
               components,
               has_migration_history: hasMigrationHistory,
               verification: {
@@ -410,6 +529,11 @@ jobs:
 
             const bundleSha = sha256File(bundle);
             fs.writeFileSync(shaFile, `${bundleSha}  ${path.basename(bundle)}\n`, { mode: 0o600 });
+
+            // Raw SQL files are no longer needed after the archive, sidecar manifest and checksum
+            // have been created. Removing them here substantially reduces local disk pressure when
+            // many large schools are backed up sequentially on a 14-GB GitHub-hosted runner.
+            fs.rmSync(dir, { recursive: true, force: true });
 
             console.log(`OK [${slug}] ${bundle}`);
             return { slug, bundle, shaFile, manifest: sideManifest, bundleSha, createdAt: manifest.created_at_utc };
@@ -467,12 +591,9 @@ jobs:
 
           const bucket = process.env.R2_BUCKET_NAME || '';
           const prefix = process.env.BACKUP_PREFIX || 'database_backups';
-          const safetyPrefix = process.env.SAFETY_PREFIX || 'database_backups_safety';
           const backupFormat = process.env.BACKUP_FORMAT || 'supabase-cli-r2-v1';
           const retentionDays = Number(process.env.RETENTION_DAYS || 30);
           const minKeep = Math.max(1, Number(process.env.MIN_BACKUPS_PER_SCHOOL || 3));
-          const safetyRetentionDays = Number(process.env.SAFETY_RETENTION_DAYS || 30);
-          const minSafetyKeep = Math.max(1, Number(process.env.MIN_SAFETY_BACKUPS_PER_SCHOOL || 3));
           if (!bucket) throw new Error('Missing R2_BUCKET_NAME');
 
           function run(command, args) {
@@ -495,7 +616,14 @@ jobs:
 
           function sha256File(file) {
             const h = crypto.createHash('sha256');
-            h.update(fs.readFileSync(file));
+            const fd = fs.openSync(file, 'r');
+            const buf = Buffer.allocUnsafe(1024 * 1024);
+            try {
+              let n;
+              while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
+            } finally {
+              fs.closeSync(fd);
+            }
             return h.digest('hex');
           }
 
@@ -507,14 +635,15 @@ jobs:
             const remoteManifest = `${remoteBundle}.manifest.json`;
             const tmp = path.join(os.tmpdir(), `${process.pid}-${bundleName}`);
             console.log(`Uploading [${item.slug}] ${bundleName}`);
+            const transferFlags = ['--s3-no-check-bucket', '--retries', '5', '--low-level-retries', '10', '--contimeout', '30s', '--timeout', '10m'];
             try {
-              await run('rclone', ['copyto', item.bundle, remoteBundle, '--s3-no-check-bucket']);
-              await run('rclone', ['copyto', remoteBundle, tmp, '--s3-no-check-bucket']);
+              await run('rclone', ['copyto', item.bundle, remoteBundle, ...transferFlags]);
+              await run('rclone', ['copyto', remoteBundle, tmp, ...transferFlags]);
               const remoteHash = sha256File(tmp);
               fs.rmSync(tmp, { force: true });
               if (remoteHash !== item.bundleSha) throw new Error(`SHA-256 mismatch after R2 round trip: expected ${item.bundleSha}, got ${remoteHash}`);
-              await run('rclone', ['copyto', item.shaFile, remoteSha, '--s3-no-check-bucket']);
-              await run('rclone', ['copyto', item.manifest, remoteManifest, '--s3-no-check-bucket']);
+              await run('rclone', ['copyto', item.shaFile, remoteSha, ...transferFlags]);
+              await run('rclone', ['copyto', item.manifest, remoteManifest, ...transferFlags]);
               console.log(`VERIFIED R2 [${item.slug}] ${bundleName}`);
               return true;
             } catch (e) {
@@ -538,6 +667,47 @@ jobs:
             }
           }
 
+          function validVietnamStampToEpoch(stamp) {
+            const m = String(stamp || '').match(/^(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{4})$/);
+            if (!m) return null;
+            const [, hh, mm, ss, dd, mo, yyyy] = m.map((x, i) => i === 0 ? x : Number(x));
+            if (hh > 23 || mm > 59 || ss > 59 || mo < 1 || mo > 12 || dd < 1 || dd > 31) return null;
+            // Vietnam has a fixed UTC+7 civil offset and no DST. Convert local filename time to UTC epoch.
+            const epochMs = Date.UTC(yyyy, mo - 1, dd, hh - 7, mm, ss);
+            const check = new Date(epochMs + 7 * 3600 * 1000);
+            if (check.getUTCFullYear() !== yyyy || check.getUTCMonth() + 1 !== mo || check.getUTCDate() !== dd ||
+                check.getUTCHours() !== hh || check.getUTCMinutes() !== mm || check.getUTCSeconds() !== ss) return null;
+            return epochMs;
+          }
+
+          function snapshotInfoForBundle(base, slug) {
+            const escSlug = slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+            // Current short filename family (Vietnam local time):
+            // <slug>_<HH-MM-SS>_<DD-MM-YYYY>.tar.gz
+            let m = String(base || '').match(new RegExp(`^${escSlug}_(\\d{2}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{4})\\.tar\\.gz$`));
+            if (m) {
+              const epochMs = validVietnamStampToEpoch(m[1]);
+              if (epochMs !== null) return { epochMs, naming: 'short-vn', stamp: m[1] };
+            }
+
+            // Backward compatibility with backups created by v7 and earlier:
+            // <slug>_<YYYYMMDDTHHMMSSZ>_<format>.tar.gz
+            const escFormat = backupFormat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            m = String(base || '').match(new RegExp(`^${escSlug}_(\\d{8})T(\\d{2})(\\d{2})(\\d{2})Z_${escFormat}\\.tar\\.gz$`));
+            if (m) {
+              const y = Number(m[1].slice(0, 4)), mo = Number(m[1].slice(4, 6)), d = Number(m[1].slice(6, 8));
+              const hh = Number(m[2]), mm = Number(m[3]), ss = Number(m[4]);
+              const epochMs = Date.UTC(y, mo - 1, d, hh, mm, ss);
+              const check = new Date(epochMs);
+              if (check.getUTCFullYear() === y && check.getUTCMonth() + 1 === mo && check.getUTCDate() === d &&
+                  check.getUTCHours() === hh && check.getUTCMinutes() === mm && check.getUTCSeconds() === ss) {
+                return { epochMs, naming: 'legacy-v7', stamp: `${m[1]}T${m[2]}${m[3]}${m[4]}Z` };
+              }
+            }
+            return null;
+          }
+
           function managedArtifactInfo(fileName, slug) {
             let base = '';
             let kind = '';
@@ -554,12 +724,11 @@ jobs:
               return null;
             }
 
-            // Only touch artifacts created by this workflow family. This deliberately
-            // excludes unrelated .tar.gz/.sha256/.json objects that a user may keep
-            // in the same R2 folder. It also matches pre-restore safety bundles because
-            // their base name still starts with the slug and ends with the same format.
-            if (!base.startsWith(`${slug}_`) || !base.endsWith(`_${backupFormat}.tar.gz`)) return null;
-            return { base, kind };
+            // Only touch exact backup artifacts from the current short naming family or
+            // the immediately preceding v7 family. Unrelated archives are ignored.
+            const snapshot = snapshotInfoForBundle(base, slug);
+            if (!snapshot) return null;
+            return { base, kind, ...snapshot };
           }
 
           async function cleanupCompleteRetention(slug) {
@@ -567,14 +736,25 @@ jobs:
             const files = await listRemoteFiles(remoteDir);
             const byName = new Map(files.map(f => [f.Path, f]));
             const bundles = files
-              .filter(f => f.Path.endsWith('.tar.gz'))
-              .filter(f => byName.has(`${f.Path}.sha256`) && byName.has(`${f.Path}.manifest.json`))
-              .sort((a, b) => new Date(b.ModTime) - new Date(a.ModTime));
+              .map(f => ({ file: f, info: managedArtifactInfo(String(f.Path || ''), slug) }))
+              .filter(x => x.info?.kind === 'bundle')
+              .filter(x => byName.has(`${x.file.Path}.sha256`) && byName.has(`${x.file.Path}.manifest.json`))
+              // Sort by the parsed snapshot time, not lexical filename order: the short filename
+              // begins with HH-MM-SS, so simple string sorting would be chronologically wrong.
+              .sort((a, b) => b.info.epochMs - a.info.epochMs || String(b.file.Path).localeCompare(String(a.file.Path)))
+              .map(x => x.file);
             const cutoff = Date.now() - retentionDays * 86400 * 1000;
             const keep = new Set(bundles.slice(0, minKeep).map(f => f.Path));
             for (const b of bundles) {
               if (keep.has(b.Path)) continue;
-              if (new Date(b.ModTime).getTime() >= cutoff) continue;
+              // Delete only when ALL THREE members of the complete set are older than retention.
+              const parts = [b, byName.get(`${b.Path}.sha256`), byName.get(`${b.Path}.manifest.json`)];
+              const times = parts.map(f => new Date(f?.ModTime).getTime());
+              if (times.some(t => !Number.isFinite(t))) {
+                console.warn(`Retention skipped ${b.Path}: invalid ModTime on one or more artifacts.`);
+                continue;
+              }
+              if (Math.max(...times) >= cutoff) continue;
               for (const suffix of ['.manifest.json', '.sha256', '']) {
                 const remote = `${remoteDir}/${b.Path}${suffix}`;
                 try {
@@ -584,62 +764,6 @@ jobs:
                   console.warn(`Retention warning for ${remote}: ${String(e.message || e).slice(0, 1000)}`);
                 }
               }
-            }
-          }
-
-          async function cleanupSafetyCompleteRetention(slug) {
-            const remoteDir = `r2:${bucket}/${safetyPrefix}/${slug}`;
-            const files = await listRemoteFiles(remoteDir);
-            const byName = new Map(files.map(f => [f.Path, f]));
-            const safetySuffix = `_pre_restore_safety_${backupFormat}.tar.gz`;
-
-            // Only consider exact pre-restore safety bundle names created by restore v9:
-            // <slug>_<YYYYMMDDTHHMMSSZ>_pre_restore_safety_<format>.tar.gz
-            const bundles = files
-              .filter(f => {
-                const name = String(f.Path || '');
-                if (!name.startsWith(`${slug}_`) || !name.endsWith(safetySuffix)) return false;
-                const stamp = name.slice(`${slug}_`.length, -safetySuffix.length);
-                return /^\d{8}T\d{6}Z$/.test(stamp);
-              })
-              .filter(f => byName.has(`${f.Path}.sha256`) && byName.has(`${f.Path}.manifest.json`))
-              .sort((a, b) => new Date(b.ModTime) - new Date(a.ModTime));
-
-            const cutoff = Date.now() - safetyRetentionDays * 86400 * 1000;
-            const keep = new Set(bundles.slice(0, minSafetyKeep).map(f => f.Path));
-            let deletedSets = 0;
-            let deletedFiles = 0;
-
-            for (const b of bundles) {
-              if (keep.has(b.Path)) continue;
-
-              // Delete a complete safety set only when ALL THREE artifacts are older
-              // than the retention window. A recently rewritten sidecar protects the set.
-              const parts = [b, byName.get(`${b.Path}.sha256`), byName.get(`${b.Path}.manifest.json`)];
-              const times = parts.map(f => new Date(f?.ModTime).getTime());
-              if (times.some(t => !Number.isFinite(t))) {
-                console.warn(`Safety retention skipped ${b.Path}: invalid ModTime on one or more artifacts.`);
-                continue;
-              }
-              if (Math.max(...times) >= cutoff) continue;
-
-              let allDeleted = true;
-              for (const suffix of ['.manifest.json', '.sha256', '']) {
-                const remote = `${remoteDir}/${b.Path}${suffix}`;
-                try {
-                  await run('rclone', ['deletefile', remote, '--s3-no-check-bucket']);
-                  deletedFiles++;
-                  console.log(`Safety retention deleted: ${remote}`);
-                } catch (e) {
-                  allDeleted = false;
-                  console.warn(`Safety retention warning for ${remote}: ${String(e.message || e).slice(0, 1000)}`);
-                }
-              }
-              if (allDeleted) deletedSets++;
-            }
-
-            if (deletedSets || deletedFiles) {
-              console.log(`Safety retention summary [${slug}]: sets_deleted=${deletedSets}, files_deleted=${deletedFiles}, kept_minimum=${minSafetyKeep}, retention_days=${safetyRetentionDays}`);
             }
           }
 
@@ -660,7 +784,7 @@ jobs:
               const complete = parts.has('bundle') && parts.has('sha256') && parts.has('manifest');
               if (complete) continue;
 
-              // Safety rule: use the NEWEST timestamp among the surviving pieces.
+              // Conservative orphan rule: use the NEWEST timestamp among the surviving pieces.
               // The set is deleted only when every existing piece is older than the
               // retention window, so an upload currently in progress can never qualify.
               const times = [...parts.values()]
@@ -709,17 +833,12 @@ jobs:
             for (const slug of successfulSlugs) {
               try { await cleanupCompleteRetention(slug); }
               catch (e) { console.warn(`Complete-set cleanup warning [${slug}]: ${String(e.message || e).slice(0, 3000)}`); }
-              // Safety complete-set retention is intentionally gated by a newly VERIFIED
-              // main backup for this slug. If today's backup failed, no valid safety
-              // recovery point is aged out during that run.
-              try { await cleanupSafetyCompleteRetention(slug); }
-              catch (e) { console.warn(`Safety complete-set cleanup warning [${slug}]: ${String(e.message || e).slice(0, 3000)}`); }
             }
 
-            // Orphan files are not valid restore points, so they may be cleaned even
-            // when today's backup for that slug failed. Limit this to slugs present in
-            // the current D1-driven report, require age > RETENTION_DAYS, and only touch
-            // files that match this workflow's exact backup naming family.
+            // Orphan files in the main backup directory are not valid restore points, so
+            // they may be cleaned even when today's backup for that slug failed. Limit
+            // this to slugs present in the current D1-driven report, require age >
+            // RETENTION_DAYS, and only touch this workflow's exact backup naming family.
             const knownSlugs = new Set([
               ...(report.results || []).map(x => String(x.slug || '')),
               ...(report.failures || []).map(x => String(x.slug || ''))
@@ -730,11 +849,6 @@ jobs:
                 await cleanupOrphansInDir(`r2:${bucket}/${prefix}/${slug}`, slug, 'main');
               } catch (e) {
                 console.warn(`Orphan cleanup warning [main] [${slug}]: ${String(e.message || e).slice(0, 3000)}`);
-              }
-              try {
-                await cleanupOrphansInDir(`r2:${bucket}/${safetyPrefix}/${slug}`, slug, 'safety', safetyRetentionDays);
-              } catch (e) {
-                console.warn(`Orphan cleanup warning [safety] [${slug}]: ${String(e.message || e).slice(0, 3000)}`);
               }
             }
 
