@@ -1,4 +1,4 @@
-name: Supabase CLI Restore Simple - Source to Clean Target v2
+name: Supabase CLI Restore Auto Target - Source to Logical Destination v3
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         type: string
       target_slug:
-        description: 'Slug DICH: dong trong D1 tro toi Supabase project/database SACH de nhan ban phuc hoi'
+        description: 'Slug DICH logic: co the trung slug nguon. He thong tu tim project/database SACH (uu tien <slug>-green, <slug>-restore, <slug>-dr...)'
         required: true
         type: string
 
@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: supabase-db-restore-simple-${{ github.repository }}
+  group: supabase-db-restore-auto-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -114,9 +114,6 @@ jobs:
           for (const [name, value] of [['source_slug', sourceSlug], ['target_slug', targetSlug]]) {
             if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error(`${name} is invalid.`);
           }
-          if (sourceSlug === targetSlug) {
-            throw new Error('source_slug and target_slug must be different. target_slug must point to a clean Supabase project/database.');
-          }
 
           const managedSchemas = new Set([
             'auth', 'storage', 'realtime', 'graphql', 'graphql_public',
@@ -172,15 +169,25 @@ jobs:
             return { rows: block.results || [], meta: block.meta || {} };
           }
 
-          async function loadTargetUrl() {
+          async function loadD1TargetRow(slug) {
             const { rows } = await d1Query(
               'SELECT slug, supabase_sql FROM danh_sach_truong WHERE slug = ? LIMIT 1',
-              [targetSlug]
+              [slug]
             );
-            if (!rows.length || !String(rows[0].supabase_sql || '')) {
-              throw new Error(`D1 has no usable supabase_sql for target_slug [${targetSlug}].`);
-            }
-            return String(rows[0].supabase_sql);
+            if (!rows.length || !String(rows[0].supabase_sql || '')) return null;
+            return { slug: String(rows[0].slug || slug), url: String(rows[0].supabase_sql) };
+          }
+
+          function targetCandidateSlugs(logicalSlug) {
+            const raw = [
+              logicalSlug,
+              `${logicalSlug}-green`, `${logicalSlug}_green`,
+              `${logicalSlug}-restore`, `${logicalSlug}_restore`,
+              `${logicalSlug}-dr`, `${logicalSlug}_dr`,
+              `${logicalSlug}-staging`, `${logicalSlug}_staging`,
+              `${logicalSlug}-new`, `${logicalSlug}_new`
+            ];
+            return [...new Set(raw.filter(Boolean))];
           }
 
           function pgEnvFromUrl(dbUrl) {
@@ -250,7 +257,7 @@ jobs:
             return out ? out.split(/\r?\n/).filter(Boolean) : [];
           }
 
-          async function assertCleanTarget(dbUrl) {
+          async function inspectTargetCleanliness(dbUrl) {
             const appRelations = Number(await psql(dbUrl, `
               SELECT count(*)
               FROM pg_class c
@@ -276,7 +283,38 @@ jobs:
             if ((authIdentities || 0) > 0) dirty.push(`auth.identities=${authIdentities}`);
             if ((storageObjects || 0) > 0) dirty.push(`storage.objects=${storageObjects}`);
             if ((storageBuckets || 0) > 0) dirty.push(`storage.buckets=${storageBuckets}`);
-            if (dirty.length) throw new Error(`Clean target check FAILED: ${dirty.join(', ')}. Use a newly created/empty Supabase target.`);
+            return { clean: dirty.length === 0, dirty };
+          }
+
+          async function resolveCleanTarget(logicalSlug) {
+            const attempts = [];
+            for (const candidateSlug of targetCandidateSlugs(logicalSlug)) {
+              const row = await loadD1TargetRow(candidateSlug);
+              if (!row) {
+                attempts.push(`${candidateSlug}: no D1 row`);
+                continue;
+              }
+              try {
+                const status = await inspectTargetCleanliness(row.url);
+                if (status.clean) {
+                  console.log(`AUTO TARGET RESOLVED: logical [${logicalSlug}] -> clean D1 row [${row.slug}]`);
+                  return { logicalSlug, actualSlug: row.slug, url: row.url };
+                }
+                attempts.push(`${candidateSlug}: not clean (${status.dirty.join(', ')})`);
+              } catch (err) {
+                attempts.push(`${candidateSlug}: unavailable (${safeError(err).split('\n')[0]})`);
+              }
+            }
+            throw new Error(
+              `No clean Supabase target could be auto-selected for logical target [${logicalSlug}]. ` +
+              `Create one empty Supabase project/database and add a D1 row such as [${logicalSlug}-green]. ` +
+              `Checked: ${attempts.join(' | ')}`
+            );
+          }
+
+          async function assertCleanTarget(dbUrl) {
+            const status = await inspectTargetCleanliness(dbUrl);
+            if (!status.clean) throw new Error(`Clean target check FAILED: ${status.dirty.join(', ')}.`);
             console.log('Clean target check OK.');
           }
 
@@ -494,23 +532,27 @@ jobs:
           }
 
           async function main() {
-            console.log(`SOURCE slug: [${sourceSlug}]`);
-            console.log(`TARGET slug: [${targetSlug}]`);
-            console.log('AUTO MODE: selecting latest complete backup; restore+verify only; no D1 cutover will be performed.');
+            console.log(`SOURCE backup slug: [${sourceSlug}]`);
+            console.log(`TARGET logical slug: [${targetSlug}]`);
+            if (sourceSlug === targetSlug) {
+              console.log('INFO: source_slug equals target_slug. This is allowed in v3; the workflow will NOT overwrite the live database. It will auto-select a clean shadow target (for example -green/-restore/-dr).');
+            }
+            console.log('AUTO MODE: latest complete backup + automatic clean-target discovery + restore + verification. No D1 production cutover is performed by this workflow.');
 
-            const targetUrl = await loadTargetUrl();
+            const resolvedTarget = await resolveCleanTarget(targetSlug);
             const { name, manifest } = await selectAndDownloadBackup();
             console.log(`AUTO SELECTED backup: ${name}`);
+            console.log(`AUTO SELECTED clean target: [${resolvedTarget.actualSlug}] for logical destination [${targetSlug}]`);
 
-            await assertCleanTarget(targetUrl);
-            await restoreIntoCleanTarget(targetUrl, manifest);
-            const verification = await verifyTarget(targetUrl, manifest);
+            await assertCleanTarget(resolvedTarget.url);
+            await restoreIntoCleanTarget(resolvedTarget.url, manifest);
+            const verification = await verifyTarget(resolvedTarget.url, manifest);
 
             console.log('RESTORE+VERIFY SUCCESS.');
-            console.log(`Backup source [${sourceSlug}] has been restored into clean target [${targetSlug}].`);
-            console.log('The D1 target row was NOT swapped or changed; production cutover remains a separate administrative action.');
+            console.log(`Backup source [${sourceSlug}] has been restored into clean target [${resolvedTarget.actualSlug}] for logical destination [${targetSlug}].`);
+            console.log('The live/production D1 row was NOT swapped or changed. This preserves the current production database until a separate cutover is approved.');
             if (verification.warnings.length) {
-              console.warn(`Completed with ${verification.warnings.length} external/project-level warning(s); review them before routing production traffic to the target.`);
+              console.warn(`Completed with ${verification.warnings.length} external/project-level warning(s); review them before routing production traffic to the restored target.`);
             }
           }
 
