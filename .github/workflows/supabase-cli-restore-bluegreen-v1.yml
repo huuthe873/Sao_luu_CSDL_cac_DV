@@ -1,15 +1,16 @@
-name: Supabase CLI Restore Auto Target - Source to Logical Destination v3
+name: Supabase CLI Restore Direct v4 - suffix + optional backup file
 
 on:
   workflow_dispatch:
     inputs:
-      source_slug:
-        description: 'Slug NGUON: thu muc backup tren R2 can phuc hoi (he thong tu chon ban backup hoan chinh moi nhat)'
+      suffix:
+        description: 'Suffix/slug cua truong can phuc hoi (D1 slug va thu muc backup mac dinh)'
         required: true
         type: string
-      target_slug:
-        description: 'Slug DICH logic: co the trung slug nguon. He thong tu tim project/database SACH (uu tien <slug>-green, <slug>-restore, <slug>-dr...)'
-        required: true
+      backup_file:
+        description: 'Ten backup .tar.gz; de trong = tu dong chon backup hoan chinh moi nhat'
+        required: false
+        default: ''
         type: string
 
 defaults:
@@ -20,18 +21,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: supabase-db-restore-auto-${{ github.repository }}
+  group: supabase-db-restore-direct-${{ github.repository }}
   cancel-in-progress: false
 
 env:
   BACKUP_FORMAT: supabase-cli-r2-v1
   BACKUP_PREFIX: database_backups_cli
+  SAFETY_PREFIX: database_backups_cli_safety
   SUPABASE_CLI_VERSION: '2.117.0'
 
 jobs:
   restore:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repository
@@ -69,7 +71,7 @@ jobs:
           : "${R2_SECRET_ACCESS_KEY:?Missing R2_SECRET_ACCESS_KEY}"
           mkdir -p ~/.config/rclone
           chmod 700 ~/.config/rclone
-          cat > ~/.config/rclone/rclone.conf <<EOF
+          cat > ~/.config/rclone/rclone.conf <<EOF_RCLONE
           [r2]
           type = s3
           provider = Cloudflare
@@ -78,20 +80,20 @@ jobs:
           region = auto
           endpoint = https://$CF_ACCOUNT_ID.r2.cloudflarestorage.com
           no_check_bucket = true
-          EOF
+          EOF_RCLONE
           chmod 600 ~/.config/rclone/rclone.conf
 
-      - name: Auto restore latest backup to clean target and verify
+      - name: Restore selected suffix
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_D1_DB_ID: ${{ secrets.CF_D1_DB_ID }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          SOURCE_SLUG: ${{ github.event.inputs.source_slug }}
-          TARGET_SLUG: ${{ github.event.inputs.target_slug }}
+          INPUT_SUFFIX: ${{ github.event.inputs.suffix }}
+          INPUT_BACKUP_FILE: ${{ github.event.inputs.backup_file }}
         run: |
           set -euo pipefail
-          cat > restore_bluegreen.js <<'NODE'
+          cat > restore_direct_v4.js <<'NODE'
           const fs = require('fs');
           const path = require('path');
           const crypto = require('crypto');
@@ -102,18 +104,14 @@ jobs:
           const cfDbId = process.env.CF_D1_DB_ID || '';
           const bucket = process.env.R2_BUCKET_NAME || '';
           const prefix = process.env.BACKUP_PREFIX || 'database_backups_cli';
+          const safetyPrefix = process.env.SAFETY_PREFIX || 'database_backups_cli_safety';
           const expectedFormat = process.env.BACKUP_FORMAT || 'supabase-cli-r2-v1';
-
-          const sourceSlug = (process.env.SOURCE_SLUG || '').trim();
-          const targetSlug = (process.env.TARGET_SLUG || '').trim();
-          const backupSourceSlug = sourceSlug;
-          const backupFileInput = 'latest';
+          const suffix = (process.env.INPUT_SUFFIX || '').trim();
+          const requestedFile = (process.env.INPUT_BACKUP_FILE || '').trim();
 
           if (!cfAccountId || !cfApiToken || !cfDbId) throw new Error('Missing Cloudflare D1 secrets.');
           if (!bucket) throw new Error('Missing R2_BUCKET_NAME.');
-          for (const [name, value] of [['source_slug', sourceSlug], ['target_slug', targetSlug]]) {
-            if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error(`${name} is invalid.`);
-          }
+          if (!/^[A-Za-z0-9_-]+$/.test(suffix)) throw new Error('suffix is invalid.');
 
           const managedSchemas = new Set([
             'auth', 'storage', 'realtime', 'graphql', 'graphql_public',
@@ -124,7 +122,7 @@ jobs:
 
           function safeError(err) {
             const text = String(err && (err.stderr || err.message || err) || 'Unknown error');
-            return text.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, '[DATABASE_URL_REDACTED]').slice(0, 12000);
+            return text.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, '[DATABASE_URL_REDACTED]').slice(0, 16000);
           }
 
           function run(command, args, options = {}) {
@@ -138,12 +136,12 @@ jobs:
               child.stdout.on('data', d => {
                 const s = d.toString(); stdout += s;
                 if (options.echoStdout) process.stdout.write(s);
-                if (stdout.length > 12 * 1024 * 1024) stdout = stdout.slice(-12 * 1024 * 1024);
+                if (stdout.length > 16 * 1024 * 1024) stdout = stdout.slice(-16 * 1024 * 1024);
               });
               child.stderr.on('data', d => {
                 const s = d.toString(); stderr += s;
                 if (options.echoStderr !== false) process.stderr.write(s);
-                if (stderr.length > 12 * 1024 * 1024) stderr = stderr.slice(-12 * 1024 * 1024);
+                if (stderr.length > 16 * 1024 * 1024) stderr = stderr.slice(-16 * 1024 * 1024);
               });
               child.on('error', reject);
               child.on('close', code => {
@@ -154,6 +152,8 @@ jobs:
               });
             });
           }
+
+          function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
           async function d1Query(sql, params = []) {
             const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/d1/database/${cfDbId}/query`;
@@ -166,28 +166,15 @@ jobs:
             if (!resp.ok || body.success === false) throw new Error(`D1 query failed: HTTP ${resp.status}; ${JSON.stringify(body.errors || body)}`);
             const block = body.result?.[0];
             if (!block || block.success === false) throw new Error(`D1 query result failed: ${JSON.stringify(block || body)}`);
-            return { rows: block.results || [], meta: block.meta || {} };
+            return block.results || [];
           }
 
-          async function loadD1TargetRow(slug) {
-            const { rows } = await d1Query(
-              'SELECT slug, supabase_sql FROM danh_sach_truong WHERE slug = ? LIMIT 1',
-              [slug]
-            );
-            if (!rows.length || !String(rows[0].supabase_sql || '')) return null;
-            return { slug: String(rows[0].slug || slug), url: String(rows[0].supabase_sql) };
-          }
-
-          function targetCandidateSlugs(logicalSlug) {
-            const raw = [
-              logicalSlug,
-              `${logicalSlug}-green`, `${logicalSlug}_green`,
-              `${logicalSlug}-restore`, `${logicalSlug}_restore`,
-              `${logicalSlug}-dr`, `${logicalSlug}_dr`,
-              `${logicalSlug}-staging`, `${logicalSlug}_staging`,
-              `${logicalSlug}-new`, `${logicalSlug}_new`
-            ];
-            return [...new Set(raw.filter(Boolean))];
+          async function loadTarget() {
+            const rows = await d1Query('SELECT slug, supabase_sql FROM danh_sach_truong WHERE slug = ? LIMIT 1', [suffix]);
+            if (!rows.length) throw new Error(`D1 has no row for suffix [${suffix}].`);
+            const dbUrl = String(rows[0].supabase_sql || '').trim();
+            if (!dbUrl) throw new Error(`D1 row [${suffix}] has empty supabase_sql.`);
+            return { slug: suffix, dbUrl };
           }
 
           function pgEnvFromUrl(dbUrl) {
@@ -219,7 +206,7 @@ jobs:
 
           function quoteQualified(key) {
             const idx = key.indexOf('.');
-            if (idx <= 0) throw new Error(`Invalid qualified table name in manifest: ${key}`);
+            if (idx <= 0) throw new Error(`Invalid qualified table name: ${key}`);
             const a = key.slice(0, idx), b = key.slice(idx + 1);
             return '"' + a.replace(/"/g, '""') + '"."' + b.replace(/"/g, '""') + '"';
           }
@@ -229,46 +216,111 @@ jobs:
             return Number(await psql(dbUrl, `SELECT count(*)::bigint FROM ${quoteQualified(key)};`) || 0);
           }
 
+          function sha256File(file) {
+            const h = crypto.createHash('sha256');
+            const fd = fs.openSync(file, 'r');
+            const buf = Buffer.allocUnsafe(1024 * 1024);
+            try {
+              let n;
+              while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
+            } finally { fs.closeSync(fd); }
+            return h.digest('hex');
+          }
+
+          function parseQualifiedName(raw) {
+            const quoted = raw.match(/^"((?:[^"]|"")+)"\."((?:[^"]|"")+)"$/);
+            if (quoted) return [quoted[1].replace(/""/g, '"'), quoted[2].replace(/""/g, '"')];
+            const idx = raw.indexOf('.');
+            if (idx > 0) return [raw.slice(0, idx).replace(/^"|"$/g, ''), raw.slice(idx + 1).replace(/^"|"$/g, '')];
+            return ['public', raw.replace(/^"|"$/g, '')];
+          }
+
+          function parseCopyTableNames(dataFile) {
+            const lines = fs.readFileSync(dataFile, 'utf8').split(/\r?\n/);
+            const names = [];
+            for (const line of lines) {
+              const m = line.match(/^COPY\s+(.+?)\s+\(.+\)\s+FROM stdin;$/);
+              if (!m) continue;
+              const [schema, table] = parseQualifiedName(m[1]);
+              if (!schema || !table) throw new Error(`Invalid COPY target: ${m[1]}`);
+              names.push(`${schema}.${table}`);
+            }
+            return [...new Set(names)].sort();
+          }
+
+          function parseCopyCounts(dataFile) {
+            const text = fs.readFileSync(dataFile, 'utf8');
+            const lines = text.split(/\r?\n/);
+            const counts = {};
+            let current = null, count = 0;
+            for (const line of lines) {
+              if (!current) {
+                const m = line.match(/^COPY\s+(.+?)\s+\(.+\)\s+FROM stdin;$/);
+                if (m) { current = m[1]; count = 0; }
+              } else if (line === '\\.') {
+                const [schema, table] = parseQualifiedName(current);
+                counts[`${schema}.${table}`] = count;
+                current = null; count = 0;
+              } else count++;
+            }
+            if (current) throw new Error('data.sql ended inside a COPY block.');
+            return Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
+          }
+
+          function normalizeSql(text) {
+            return text.split(/\r?\n/)
+              .map(s => s.trim())
+              .filter(s => s && !s.startsWith('--') && !/^\\(?:un)?restrict\b/i.test(s))
+              .map(s => s.replace(/\s+/g, ' '))
+              .join('\n');
+          }
+
+          function schemaFingerprint(file) {
+            return crypto.createHash('sha256').update(normalizeSql(fs.readFileSync(file, 'utf8'))).digest('hex');
+          }
+
           async function collectManagedSignatures(dbUrl) {
-            const triggersSql = `
+            const tr = await psql(dbUrl, `
               SELECT event_object_schema || '.' || event_object_table || '|' || trigger_name || '|' || event_manipulation || '|' || action_timing || '|' || action_orientation || '|' || coalesce(action_statement,'')
               FROM information_schema.triggers
-              WHERE event_object_schema IN ('auth','storage','realtime')
-              ORDER BY 1;`;
-            const policiesSql = `
+              WHERE event_object_schema IN ('auth','storage','realtime') ORDER BY 1;`, '\x1f');
+            const po = await psql(dbUrl, `
               SELECT schemaname || '.' || tablename || '|' || policyname || '|' || cmd || '|' || permissive || '|' || coalesce(array_to_string(roles,','),'') || '|' || coalesce(qual,'') || '|' || coalesce(with_check,'')
-              FROM pg_policies
-              WHERE schemaname IN ('auth','storage','realtime')
-              ORDER BY 1;`;
-            const tr = await psql(dbUrl, triggersSql, '\x1f');
-            const po = await psql(dbUrl, policiesSql, '\x1f');
-            return { triggers: tr ? tr.split(/\r?\n/).filter(Boolean) : [], policies: po ? po.split(/\r?\n/).filter(Boolean) : [] };
+              FROM pg_policies WHERE schemaname IN ('auth','storage','realtime') ORDER BY 1;`, '\x1f');
+            return {
+              triggers: tr ? tr.split(/\r?\n/).filter(Boolean) : [],
+              policies: po ? po.split(/\r?\n/).filter(Boolean) : []
+            };
+          }
+
+          async function collectExtensions(dbUrl) {
+            const out = await psql(dbUrl, `SELECT extname || '|' || extversion FROM pg_extension ORDER BY extname;`, '\x1f');
+            return out ? out.split(/\r?\n/).filter(Boolean).map(line => {
+              const i = line.indexOf('|');
+              return { name: line.slice(0, i), version: line.slice(i + 1) };
+            }) : [];
           }
 
           async function collectExtensionNames(dbUrl) {
-            const out = await psql(dbUrl, 'SELECT extname FROM pg_extension ORDER BY extname;', '\x1f');
-            return out ? out.split(/\r?\n/).filter(Boolean) : [];
+            return (await collectExtensions(dbUrl)).map(x => x.name);
           }
 
           async function collectRealtimeTables(dbUrl) {
-            const pub = (await psql(dbUrl, `SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN '1' ELSE '0' END;`)) === '1';
-            if (!pub) return [];
+            const exists = (await psql(dbUrl, `SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN '1' ELSE '0' END;`)) === '1';
+            if (!exists) return [];
             const out = await psql(dbUrl, `SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname='supabase_realtime' ORDER BY schemaname, tablename;`, '\x1f');
             return out ? out.split(/\r?\n/).filter(Boolean) : [];
           }
 
-          async function inspectTargetCleanliness(dbUrl) {
+          async function inspectTarget(dbUrl) {
             const appRelations = Number(await psql(dbUrl, `
-              SELECT count(*)
-              FROM pg_class c
-              JOIN pg_namespace n ON n.oid=c.relnamespace
+              SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
               WHERE c.relkind IN ('r','p','v','m','S')
                 AND n.nspname NOT IN ('auth','storage','realtime','graphql','graphql_public','extensions','pgbouncer','pgsodium','pgsodium_masks','vault','cron','supabase_functions','supabase_migrations','net','_realtime','_analytics','information_schema')
                 AND n.nspname NOT LIKE 'pg_%'
                 AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid=c.oid AND d.deptype='e');`));
             const appFunctions = Number(await psql(dbUrl, `
-              SELECT count(*)
-              FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+              SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
               WHERE n.nspname NOT IN ('auth','storage','realtime','graphql','graphql_public','extensions','pgbouncer','pgsodium','pgsodium_masks','vault','cron','supabase_functions','supabase_migrations','net','_realtime','_analytics','information_schema')
                 AND n.nspname NOT LIKE 'pg_%'
                 AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid=p.oid AND d.deptype='e');`));
@@ -286,95 +338,75 @@ jobs:
             return { clean: dirty.length === 0, dirty };
           }
 
-          async function resolveCleanTarget(logicalSlug) {
-            const attempts = [];
-            for (const candidateSlug of targetCandidateSlugs(logicalSlug)) {
-              const row = await loadD1TargetRow(candidateSlug);
-              if (!row) {
-                attempts.push(`${candidateSlug}: no D1 row`);
-                continue;
-              }
-              try {
-                const status = await inspectTargetCleanliness(row.url);
-                if (status.clean) {
-                  console.log(`AUTO TARGET RESOLVED: logical [${logicalSlug}] -> clean D1 row [${row.slug}]`);
-                  return { logicalSlug, actualSlug: row.slug, url: row.url };
-                }
-                attempts.push(`${candidateSlug}: not clean (${status.dirty.join(', ')})`);
-              } catch (err) {
-                attempts.push(`${candidateSlug}: unavailable (${safeError(err).split('\n')[0]})`);
-              }
-            }
-            throw new Error(
-              `No clean Supabase target could be auto-selected for logical target [${logicalSlug}]. ` +
-              `Create one empty Supabase project/database and add a D1 row such as [${logicalSlug}-green]. ` +
-              `Checked: ${attempts.join(' | ')}`
-            );
-          }
-
-          async function assertCleanTarget(dbUrl) {
-            const status = await inspectTargetCleanliness(dbUrl);
-            if (!status.clean) throw new Error(`Clean target check FAILED: ${status.dirty.join(', ')}.`);
-            console.log('Clean target check OK.');
-          }
-
-          function sha256File(file) {
-            const h = crypto.createHash('sha256');
-            h.update(fs.readFileSync(file));
-            return h.digest('hex');
-          }
-
           function normalizeBackupName(input) {
-            let v = (input || 'latest').trim().replace(/^['"]|['"]$/g, '');
+            let v = String(input || '').trim().replace(/^['"]|['"]$/g, '');
             if (!v || v.toLowerCase() === 'latest') return 'latest';
             v = v.replace(/\\/g, '/');
             try { if (/^https?:\/\//i.test(v)) v = new URL(v).pathname; } catch (_) {}
             v = v.split('/').filter(Boolean).pop() || '';
             if (v.endsWith('.tar.gz.sha256')) v = v.slice(0, -'.sha256'.length);
             if (v.endsWith('.tar.gz.manifest.json')) v = v.slice(0, -'.manifest.json'.length);
-            if (!/^[A-Za-z0-9_.-]+\.tar\.gz$/.test(v)) throw new Error('backup_file must be latest or a safe .tar.gz/.sha256/.manifest.json backup name.');
+            if (!/^[A-Za-z0-9_.-]+\.tar\.gz$/.test(v)) throw new Error('backup_file must be blank/latest or a safe .tar.gz/.sha256/.manifest.json name.');
             return v;
           }
 
-          async function selectAndDownloadBackup() {
-            const remoteDir = `r2:${bucket}/${prefix}/${backupSourceSlug}`;
-            const { stdout } = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket']);
-            const files = JSON.parse(stdout || '[]');
+          async function listRemoteDir(remoteDir) {
+            try {
+              const { stdout } = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket'], { echoStderr: false });
+              return JSON.parse(stdout || '[]');
+            } catch (_) { return []; }
+          }
+
+          async function resolveBackupLocation() {
+            const wanted = normalizeBackupName(requestedFile);
+            const defaultDir = `r2:${bucket}/${prefix}/${suffix}`;
+            const files = await listRemoteDir(defaultDir);
             const map = new Map(files.map(f => [f.Path, f]));
-            let name = normalizeBackupName(backupFileInput);
-            if (name === 'latest') {
+            if (wanted === 'latest') {
               const complete = files
                 .filter(f => f.Path.endsWith('.tar.gz'))
                 .filter(f => map.has(`${f.Path}.sha256`) && map.has(`${f.Path}.manifest.json`))
                 .sort((a, b) => new Date(b.ModTime) - new Date(a.ModTime));
-              if (!complete.length) throw new Error(`No complete Supabase CLI backup set found in R2 for [${backupSourceSlug}].`);
-              name = complete[0].Path;
+              if (!complete.length) throw new Error(`No complete Supabase CLI backup set found for suffix [${suffix}].`);
+              return { remoteDir: defaultDir, name: complete[0].Path };
             }
-            if (!map.has(name) || !map.has(`${name}.sha256`) || !map.has(`${name}.manifest.json`)) {
-              throw new Error(`Backup set is incomplete on R2: ${name} requires .tar.gz + .sha256 + .manifest.json.`);
+            if (map.has(wanted) && map.has(`${wanted}.sha256`) && map.has(`${wanted}.manifest.json`)) {
+              return { remoteDir: defaultDir, name: wanted };
             }
 
+            const root = `r2:${bucket}/${prefix}`;
+            const { stdout } = await run('rclone', ['lsjson', root, '--recursive', '--files-only', '--s3-no-check-bucket'], { echoStderr: false });
+            const all = JSON.parse(stdout || '[]');
+            const candidates = all.filter(f => path.posix.basename(f.Path) === wanted);
+            const complete = [];
+            const allNames = new Set(all.map(f => f.Path));
+            for (const c of candidates) {
+              if (allNames.has(`${c.Path}.sha256`) && allNames.has(`${c.Path}.manifest.json`)) complete.push(c.Path);
+            }
+            if (complete.length === 0) throw new Error(`Backup [${wanted}] was not found as a complete set in R2.`);
+            if (complete.length > 1) throw new Error(`Backup filename [${wanted}] exists in multiple R2 folders. Use a unique filename.`);
+            const full = complete[0];
+            return { remoteDir: `${root}/${path.posix.dirname(full)}`, name: path.posix.basename(full) };
+          }
+
+          async function downloadAndVerifyBackup() {
+            const loc = await resolveBackupLocation();
             fs.rmSync('restore_work', { recursive: true, force: true });
             fs.mkdirSync('restore_work', { recursive: true });
-            const localBundle = path.join('restore_work', path.basename(name));
+            const localBundle = path.join('restore_work', loc.name);
             const localSha = `${localBundle}.sha256`;
             const localManifest = `${localBundle}.manifest.json`;
-            await run('rclone', ['copyto', `${remoteDir}/${name}`, localBundle, '--s3-no-check-bucket']);
-            await run('rclone', ['copyto', `${remoteDir}/${name}.sha256`, localSha, '--s3-no-check-bucket']);
-            await run('rclone', ['copyto', `${remoteDir}/${name}.manifest.json`, localManifest, '--s3-no-check-bucket']);
+            await run('rclone', ['copyto', `${loc.remoteDir}/${loc.name}`, localBundle, '--s3-no-check-bucket']);
+            await run('rclone', ['copyto', `${loc.remoteDir}/${loc.name}.sha256`, localSha, '--s3-no-check-bucket']);
+            await run('rclone', ['copyto', `${loc.remoteDir}/${loc.name}.manifest.json`, localManifest, '--s3-no-check-bucket']);
 
             const expected = fs.readFileSync(localSha, 'utf8').trim().split(/\s+/)[0];
             const actual = sha256File(localBundle);
-            if (!/^[a-f0-9]{64}$/i.test(expected) || expected.toLowerCase() !== actual.toLowerCase()) {
-              throw new Error(`Backup SHA-256 mismatch for ${name}.`);
-            }
+            if (!/^[a-f0-9]{64}$/i.test(expected) || expected.toLowerCase() !== actual.toLowerCase()) throw new Error(`Backup SHA-256 mismatch for ${loc.name}.`);
 
             const outsideManifest = JSON.parse(fs.readFileSync(localManifest, 'utf8'));
             if (outsideManifest.format !== expectedFormat || outsideManifest.format_version !== 1) {
               throw new Error(`Unsupported backup format: ${outsideManifest.format} v${outsideManifest.format_version}`);
-            }
-            if (outsideManifest.source_slug !== backupSourceSlug) {
-              throw new Error(`Manifest source_slug [${outsideManifest.source_slug}] does not match backup_source_slug [${backupSourceSlug}].`);
             }
 
             const { stdout: listOut } = await run('tar', ['-tzf', localBundle]);
@@ -383,65 +415,169 @@ jobs:
             for (const e of entries) {
               if (e.startsWith('/') || e.includes('..') || !allowed.has(e)) throw new Error(`Unsafe or unexpected archive entry: ${e}`);
             }
-            for (const required of ['roles.sql','schema.sql','data.sql','manifest.json']) {
-              if (!entries.includes(required)) throw new Error(`Archive is missing ${required}.`);
-            }
+            for (const required of ['roles.sql','schema.sql','data.sql','manifest.json']) if (!entries.includes(required)) throw new Error(`Archive is missing ${required}.`);
             await run('tar', ['-xzf', localBundle, '--no-same-owner', '--no-same-permissions', '-C', 'restore_work']);
-            for (const e of entries) {
-              const st = fs.lstatSync(path.join('restore_work', e));
-              if (!st.isFile()) throw new Error(`Archive entry is not a regular file: ${e}`);
-            }
-
             const insideManifest = JSON.parse(fs.readFileSync(path.join('restore_work', 'manifest.json'), 'utf8'));
             if (JSON.stringify(insideManifest) !== JSON.stringify(outsideManifest)) throw new Error('Inside and sidecar manifests differ.');
             for (const [file, meta] of Object.entries(insideManifest.components || {})) {
               const f = path.join('restore_work', file);
-              if (!fs.existsSync(f)) throw new Error(`Manifest component missing from archive: ${file}`);
+              if (!fs.existsSync(f)) throw new Error(`Manifest component missing: ${file}`);
               if (sha256File(f) !== meta.sha256) throw new Error(`Component SHA-256 mismatch: ${file}`);
             }
-            console.log(`Backup verified: ${name}; source=[${insideManifest.source_slug}]; created=${insideManifest.created_at_utc}`);
-            return { name, manifest: insideManifest };
+            console.log(`Selected backup: ${loc.name}`);
+            console.log(`Backup source slug: ${insideManifest.source_slug || 'unknown'}; target suffix: ${suffix}`);
+            if (insideManifest.source_slug && insideManifest.source_slug !== suffix) {
+              console.warn(`WARNING: cross-school restore requested by explicit backup selection: [${insideManifest.source_slug}] -> [${suffix}].`);
+            }
+            return { name: loc.name, manifest: insideManifest };
           }
 
-          function makeRealtimeSql(manifest) {
-            const tables = manifest.verification?.realtime_publication_tables || [];
-            const lines = ['-- Recreate Supabase Realtime publication membership captured at backup time'];
-            for (const key of tables) {
-              if (!/^[^\.]+\.[^\.]+$/.test(key)) throw new Error(`Invalid publication table in manifest: ${key}`);
-              lines.push(`ALTER PUBLICATION "supabase_realtime" ADD TABLE ${quoteQualified(key)};`);
-            }
-            fs.writeFileSync(path.join('restore_work', 'realtime.sql'), lines.join('\n') + '\n');
+          function makeRealtimeSql(manifest, dbUrl, file) {
+            return collectRealtimeTables(dbUrl).then(actual => {
+              const expected = (manifest.verification?.realtime_publication_tables || []).slice().sort();
+              const a = new Set(actual), e = new Set(expected);
+              const lines = ['-- Restore supabase_realtime publication membership'];
+              for (const key of actual) if (!e.has(key)) lines.push(`ALTER PUBLICATION "supabase_realtime" DROP TABLE ${quoteQualified(key)};`);
+              for (const key of expected) if (!a.has(key)) lines.push(`ALTER PUBLICATION "supabase_realtime" ADD TABLE ${quoteQualified(key)};`);
+              fs.writeFileSync(file, lines.join('\n') + '\n');
+            });
           }
 
-          async function restoreIntoCleanTarget(cleanUrl, manifest) {
-            const targetExtensions = new Set(await collectExtensionNames(cleanUrl));
-            const missingExt = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !targetExtensions.has(x));
-            if (missingExt.length) throw new Error(`Clean target is missing source extensions: ${missingExt.join(', ')}. Enable them before restore.`);
-            const rt = manifest.verification?.realtime_publication_tables || [];
-            if (rt.length) {
-              const hasPub = (await psql(cleanUrl, `SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN '1' ELSE '0' END;`)) === '1';
-              if (!hasPub) throw new Error('Source uses Supabase Realtime but target has no supabase_realtime publication.');
+          async function ensureExtensions(dbUrl, manifest) {
+            const target = new Set(await collectExtensionNames(dbUrl));
+            const missing = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !target.has(x) && x !== 'plpgsql');
+            for (const ext of missing) {
+              if (!/^[A-Za-z0-9_-]+$/.test(ext)) throw new Error(`Unsafe extension name: ${ext}`);
+              console.log(`Target missing extension [${ext}]; attempting CREATE EXTENSION IF NOT EXISTS.`);
+              await psql(dbUrl, `CREATE EXTENSION IF NOT EXISTS "${ext.replace(/"/g, '""')}";`);
+            }
+            const after = new Set(await collectExtensionNames(dbUrl));
+            const stillMissing = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !after.has(x));
+            if (stillMissing.length) throw new Error(`Target is missing required extensions: ${stillMissing.join(', ')}`);
+          }
+
+          async function createSafetyBackup(dbUrl) {
+            console.log('Existing target detected: creating mandatory pre-restore safety backup first.');
+            fs.rmSync('safety_work', { recursive: true, force: true });
+            fs.mkdirSync('safety_work', { recursive: true });
+            const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z');
+            const base = `${suffix}_${stamp}_pre_restore_safety_${expectedFormat}`;
+            const dir = path.join('safety_work', base);
+            fs.mkdirSync(dir, { recursive: true });
+            const roles = path.join(dir, 'roles.sql');
+            const schema = path.join(dir, 'schema.sql');
+            const data = path.join(dir, 'data.sql');
+            const histSchema = path.join(dir, 'history_schema.sql');
+            const histData = path.join(dir, 'history_data.sql');
+
+            await run('supabase', ['db','dump','--db-url',dbUrl,'-f',roles,'--role-only'], { echoStdout: true });
+            await run('supabase', ['db','dump','--db-url',dbUrl,'-f',schema], { echoStdout: true });
+            await run('supabase', ['db','dump','--db-url',dbUrl,'-f',data,'--use-copy','--data-only','-x','storage.buckets_vectors','-x','storage.vector_indexes'], { echoStdout: true });
+            for (const f of [roles, schema, data]) if (!fs.existsSync(f) || fs.statSync(f).size === 0) throw new Error(`Safety dump component is empty: ${path.basename(f)}`);
+
+            let hasHistory = false;
+            if (await relationExists(dbUrl, 'supabase_migrations.schema_migrations')) {
+              try {
+                await run('supabase', ['db','dump','--db-url',dbUrl,'-f',histSchema,'--schema','supabase_migrations']);
+                await run('supabase', ['db','dump','--db-url',dbUrl,'-f',histData,'--use-copy','--data-only','--schema','supabase_migrations']);
+                hasHistory = fs.existsSync(histSchema) && fs.existsSync(histData) && fs.statSync(histSchema).size > 0;
+              } catch (_) { hasHistory = false; }
             }
 
-            makeRealtimeSql(manifest);
-            const baseArgs = [
-              '-X', '--single-transaction', '--variable', 'ON_ERROR_STOP=1',
-              '--file', path.resolve('restore_work/roles.sql'),
-              '--file', path.resolve('restore_work/schema.sql'),
-              '--command', 'SET session_replication_role = replica',
-              '--file', path.resolve('restore_work/data.sql')
-            ];
-            if (manifest.has_migration_history && fs.existsSync('restore_work/history_schema.sql') && fs.existsSync('restore_work/history_data.sql')) {
-              baseArgs.push('--file', path.resolve('restore_work/history_schema.sql'));
-              baseArgs.push('--file', path.resolve('restore_work/history_data.sql'));
+            const copyCounts = parseCopyCounts(data);
+            const components = {};
+            for (const f of [roles, schema, data, ...(hasHistory ? [histSchema, histData] : [])]) {
+              components[path.basename(f)] = { sha256: sha256File(f), bytes: fs.statSync(f).size };
             }
-            if ((manifest.verification?.realtime_publication_tables || []).length) {
-              baseArgs.push('--file', path.resolve('restore_work/realtime.sql'));
-            }
+            const manifest = {
+              format: expectedFormat,
+              format_version: 1,
+              source_slug: suffix,
+              created_at_utc: new Date().toISOString(),
+              supabase_cli_version: process.env.SUPABASE_CLI_VERSION || 'unknown',
+              postgres_server_version: await psql(dbUrl, 'SHOW server_version;'),
+              components,
+              has_migration_history: hasHistory,
+              safety_snapshot_before_restore: true,
+              verification: {
+                copy_row_counts: copyCounts,
+                auth_users_count: copyCounts['auth.users'] ?? await countTable(dbUrl, 'auth.users'),
+                auth_identities_count: copyCounts['auth.identities'] ?? await countTable(dbUrl, 'auth.identities'),
+                storage_buckets_count: copyCounts['storage.buckets'] ?? await countTable(dbUrl, 'storage.buckets'),
+                storage_objects_count: copyCounts['storage.objects'] ?? await countTable(dbUrl, 'storage.objects'),
+                vault_secrets_count: await countTable(dbUrl, 'vault.secrets'),
+                extensions: await collectExtensions(dbUrl),
+                realtime_publication_tables: await collectRealtimeTables(dbUrl),
+                managed_schema_signatures: await collectManagedSignatures(dbUrl),
+                custom_login_roles: []
+              },
+              limitations: {
+                storage_object_files_included: false,
+                auth_storage_custom_schema_automatically_recreated: false,
+                encryption_root_key_included: false,
+                edge_functions_included: false,
+                auth_settings_and_api_keys_included: false
+              }
+            };
+            const manifestFile = path.join(dir, 'manifest.json');
+            fs.writeFileSync(manifestFile, JSON.stringify(manifest, null, 2) + '\n');
+            const bundle = path.join('safety_work', `${base}.tar.gz`);
+            const archive = ['roles.sql','schema.sql','data.sql','manifest.json'];
+            if (hasHistory) archive.push('history_schema.sql','history_data.sql');
+            await run('tar', ['-czf', path.resolve(bundle), '-C', dir, ...archive]);
+            const sha = sha256File(bundle);
+            const shaFile = `${bundle}.sha256`;
+            const sideManifest = `${bundle}.manifest.json`;
+            fs.writeFileSync(shaFile, `${sha}  ${path.basename(bundle)}\n`);
+            fs.copyFileSync(manifestFile, sideManifest);
 
-            console.log('Starting official logical restore pattern: psql --single-transaction + ON_ERROR_STOP=1 ...');
+            const remoteDir = `r2:${bucket}/${safetyPrefix}/${suffix}`;
+            await run('rclone', ['copyto', bundle, `${remoteDir}/${path.basename(bundle)}`, '--s3-no-check-bucket']);
+            await run('rclone', ['copyto', shaFile, `${remoteDir}/${path.basename(shaFile)}`, '--s3-no-check-bucket']);
+            await run('rclone', ['copyto', sideManifest, `${remoteDir}/${path.basename(sideManifest)}`, '--s3-no-check-bucket']);
+            const verify = path.join('safety_work', `verify_${path.basename(bundle)}`);
+            await run('rclone', ['copyto', `${remoteDir}/${path.basename(bundle)}`, verify, '--s3-no-check-bucket']);
+            if (sha256File(verify) !== sha) throw new Error('Safety backup remote verification failed. Restore will NOT proceed.');
+            console.log(`Safety backup verified on R2: ${safetyPrefix}/${suffix}/${path.basename(bundle)}`);
+            return { currentSchemaFile: schema };
+          }
+
+          async function terminateClientSessions(dbUrl) {
             try {
-              await run('psql', baseArgs, { env: pgEnvFromUrl(cleanUrl), echoStdout: true, echoStderr: true });
+              const sql = `
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                  AND backend_type = 'client backend'
+                  AND usename <> 'supabase_admin';`;
+              await psql(dbUrl, sql);
+            } catch (err) {
+              console.warn(`Could not terminate all client sessions before restore: ${safeError(err).split('\n')[0]}`);
+            }
+          }
+
+          async function restoreCleanTarget(dbUrl, manifest) {
+            await ensureExtensions(dbUrl, manifest);
+            const realtimeFile = path.resolve('restore_work/realtime.sql');
+            await makeRealtimeSql(manifest, dbUrl, realtimeFile);
+            const buildArgs = () => {
+              const args = [
+                '-X','--single-transaction','--variable','ON_ERROR_STOP=1',
+                '--file',path.resolve('restore_work/roles.sql'),
+                '--file',path.resolve('restore_work/schema.sql'),
+                '--command','SET session_replication_role = replica',
+                '--file',path.resolve('restore_work/data.sql')
+              ];
+              if (manifest.has_migration_history && fs.existsSync('restore_work/history_schema.sql') && fs.existsSync('restore_work/history_data.sql')) {
+                args.push('--file',path.resolve('restore_work/history_schema.sql'),'--file',path.resolve('restore_work/history_data.sql'));
+              }
+              args.push('--file', realtimeFile);
+              return args;
+            };
+
+            try {
+              await run('psql', buildArgs(), { env: pgEnvFromUrl(dbUrl), echoStdout: true, echoStderr: true });
               return;
             } catch (firstErr) {
               const msg = safeError(firstErr);
@@ -453,7 +589,7 @@ jobs:
                 const before = fs.readFileSync(rolesPath, 'utf8');
                 const after = before.split(/\r?\n/).map(line => {
                   if (/^\s*GRANT\s+"postgres"\s+TO\s+"cli_login_postgres"/i.test(line)) {
-                    changed = true; return `-- Supabase-docs compatibility: ${line}`;
+                    changed = true; return `-- Supabase documented compatibility: ${line}`;
                   }
                   return line;
                 }).join('\n');
@@ -463,22 +599,83 @@ jobs:
                 const before = fs.readFileSync(schemaPath, 'utf8');
                 const after = before.split(/\r?\n/).map(line => {
                   if (/^\s*ALTER\s+.+\s+OWNER\s+TO\s+"supabase_admin"\s*;/i.test(line)) {
-                    changed = true; return `-- Supabase-docs compatibility: ${line}`;
+                    changed = true; return `-- Supabase documented compatibility: ${line}`;
                   }
                   return line;
                 }).join('\n');
                 fs.writeFileSync(schemaPath, after);
               }
               if (!changed) throw firstErr;
-              console.warn('Retrying once after applying only Supabase-documented compatibility exceptions. First transaction was rolled back.');
-              await run('psql', baseArgs, { env: pgEnvFromUrl(cleanUrl), echoStdout: true, echoStderr: true });
+              console.warn('First clean-target restore transaction rolled back. Retrying once after Supabase-documented compatibility filtering.');
+              await run('psql', buildArgs(), { env: pgEnvFromUrl(dbUrl), echoStdout: true, echoStderr: true });
             }
-            console.log('Restore transaction COMMITTED successfully on clean target.');
           }
 
-          async function verifyTarget(cleanUrl, manifest) {
-            const errors = [];
-            const warnings = [];
+          async function restoreExistingCompatibleTarget(dbUrl, manifest, currentSchemaFile) {
+            const backupFp = schemaFingerprint('restore_work/schema.sql');
+            const currentFp = schemaFingerprint(currentSchemaFile);
+            console.log(`Schema fingerprint backup=${backupFp}`);
+            console.log(`Schema fingerprint target=${currentFp}`);
+            if (backupFp !== currentFp) {
+              throw new Error(
+                'Existing target schema is NOT identical to the selected backup schema. ' +
+                'For safety, in-place schema replacement is refused. If the database is badly damaged, create a NEW empty Supabase project/database, update D1 supabase_sql for this same suffix, then run this workflow again.'
+              );
+            }
+
+            const tables = parseCopyTableNames('restore_work/data.sql');
+            if (manifest.has_migration_history && fs.existsSync('restore_work/history_data.sql')) {
+              tables.push(...parseCopyTableNames('restore_work/history_data.sql'));
+            }
+            const uniqueTables = [...new Set(tables)].sort();
+            for (const key of uniqueTables) {
+              if (!(await relationExists(dbUrl, key))) throw new Error(`Target schema is missing table required by backup data: ${key}`);
+            }
+            if (!uniqueTables.length) throw new Error('Backup contains no COPY tables; refusing in-place destructive restore.');
+
+            const truncateSql = [
+              "SET lock_timeout = '30s';",
+              "SET statement_timeout = '0';",
+              'SET session_replication_role = replica;',
+              `TRUNCATE TABLE ${uniqueTables.map(quoteQualified).join(', ')} RESTART IDENTITY;`
+            ].join('\n') + '\n';
+            fs.writeFileSync('restore_work/truncate.sql', truncateSql);
+            const realtimeFile = path.resolve('restore_work/realtime.sql');
+            await makeRealtimeSql(manifest, dbUrl, realtimeFile);
+
+            const args = [
+              '-X','--single-transaction','--variable','ON_ERROR_STOP=1',
+              '--command',"SET lock_timeout = '30s'",
+              '--command',"SET statement_timeout = '0'",
+              '--command','SET session_replication_role = replica',
+              '--file',path.resolve('restore_work/truncate.sql'),
+              '--file',path.resolve('restore_work/data.sql')
+            ];
+            if (manifest.has_migration_history && fs.existsSync('restore_work/history_data.sql')) args.push('--file',path.resolve('restore_work/history_data.sql'));
+            args.push('--file', realtimeFile);
+
+            let lastErr;
+            for (let attempt = 1; attempt <= 4; attempt++) {
+              await terminateClientSessions(dbUrl);
+              try {
+                console.log(`In-place data restore attempt ${attempt}/4 ...`);
+                await run('psql', args, { env: pgEnvFromUrl(dbUrl), echoStdout: true, echoStderr: true });
+                console.log('In-place data restore COMMITTED successfully.');
+                return;
+              } catch (err) {
+                lastErr = err;
+                const msg = safeError(err);
+                if (!/(deadlock detected|lock timeout|could not obtain lock|canceling statement due to lock timeout)/i.test(msg) || attempt === 4) throw err;
+                const wait = [5, 10, 20, 30][attempt - 1];
+                console.warn(`Lock contention detected; transaction rolled back. Retrying in ${wait}s.`);
+                await sleep(wait * 1000);
+              }
+            }
+            throw lastErr;
+          }
+
+          async function verifyTarget(dbUrl, manifest) {
+            const errors = [], warnings = [];
             const expectedCounts = manifest.verification?.copy_row_counts || {};
             for (const [key, expected] of Object.entries(expectedCounts)) {
               const idx = key.indexOf('.');
@@ -486,74 +683,61 @@ jobs:
               const isApp = !managedSchemas.has(schema) && !schema.startsWith('pg_') && schema !== 'information_schema';
               const isKeyManaged = ['auth.users','auth.identities','storage.buckets','storage.objects'].includes(key);
               if (!isApp && !isKeyManaged) continue;
-              const actual = await countTable(cleanUrl, key);
+              const actual = await countTable(dbUrl, key);
               if (actual === null) errors.push(`missing table ${key}`);
               else if (Number(actual) !== Number(expected)) errors.push(`row count ${key}: expected=${expected}, actual=${actual}`);
             }
 
             const expectedManaged = manifest.verification?.managed_schema_signatures || { triggers: [], policies: [] };
-            const actualManaged = await collectManagedSignatures(cleanUrl);
-            if (JSON.stringify(actualManaged.triggers) !== JSON.stringify(expectedManaged.triggers || [])) {
-              errors.push('managed-schema trigger signatures differ (auth/storage/realtime customizations or platform baseline mismatch)');
-            }
-            if (JSON.stringify(actualManaged.policies) !== JSON.stringify(expectedManaged.policies || [])) {
-              errors.push('managed-schema policy signatures differ (auth/storage/realtime customizations or platform baseline mismatch)');
-            }
+            const actualManaged = await collectManagedSignatures(dbUrl);
+            if (JSON.stringify(actualManaged.triggers) !== JSON.stringify(expectedManaged.triggers || [])) errors.push('managed-schema trigger signatures differ');
+            if (JSON.stringify(actualManaged.policies) !== JSON.stringify(expectedManaged.policies || [])) errors.push('managed-schema policy signatures differ');
 
             const expectedRealtime = (manifest.verification?.realtime_publication_tables || []).slice().sort();
-            const actualRealtime = (await collectRealtimeTables(cleanUrl)).slice().sort();
-            if (JSON.stringify(expectedRealtime) !== JSON.stringify(actualRealtime)) {
-              errors.push(`supabase_realtime membership differs: expected=${JSON.stringify(expectedRealtime)}, actual=${JSON.stringify(actualRealtime)}`);
-            }
+            const actualRealtime = (await collectRealtimeTables(dbUrl)).slice().sort();
+            if (JSON.stringify(expectedRealtime) !== JSON.stringify(actualRealtime)) errors.push('supabase_realtime publication membership differs');
 
-            const targetExt = new Set(await collectExtensionNames(cleanUrl));
+            const targetExt = new Set(await collectExtensionNames(dbUrl));
             const missingExt = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !targetExt.has(x));
-            if (missingExt.length) errors.push(`missing extensions after restore: ${missingExt.join(', ')}`);
+            if (missingExt.length) errors.push(`missing extensions: ${missingExt.join(', ')}`);
 
-            const sourceStorageObjects = Number(manifest.verification?.storage_objects_count || 0);
-            const sourceVaultSecrets = Number(manifest.verification?.vault_secrets_count || 0);
-            const customLoginRoles = manifest.verification?.custom_login_roles || [];
-            if (sourceStorageObjects > 0) warnings.push(`source has ${sourceStorageObjects} Storage object metadata row(s); actual Storage files are not included in this database logical backup`);
-            if (sourceVaultSecrets > 0) warnings.push(`source has ${sourceVaultSecrets} Vault secret row(s); logical restore does not transfer the source encryption root key`);
-            if (customLoginRoles.length) warnings.push(`custom LOGIN roles may require passwords to be configured separately: ${customLoginRoles.join(', ')}`);
-            warnings.push('Auth settings/API keys/Edge Functions and other project-level settings are outside this database logical restore and should be checked separately.');
+            const storageObjects = Number(manifest.verification?.storage_objects_count || 0);
+            const vaultSecrets = Number(manifest.verification?.vault_secrets_count || 0);
+            if (storageObjects > 0) warnings.push(`backup contains ${storageObjects} storage.objects metadata rows; actual Storage files are outside logical DB backup`);
+            if (vaultSecrets > 0) warnings.push(`backup contains ${vaultSecrets} Vault secret rows; a newly created project has a different root encryption key unless migrated separately`);
+            warnings.push('Auth settings/API keys/Edge Functions and other project-level settings are outside this logical database restore.');
 
-            if (warnings.length) {
-              console.warn('RESTORE WARNINGS (database restore itself may still be valid):');
-              for (const w of warnings) console.warn(`  - ${w}`);
-            }
+            for (const w of warnings) console.warn(`WARNING: ${w}`);
             if (errors.length) {
-              console.error('VERIFICATION ERRORS:');
-              for (const e of errors) console.error(`  - ${e}`);
-              throw new Error(`Target verification failed with ${errors.length} error(s). Production was NOT changed.`);
+              for (const e of errors) console.error(`VERIFY ERROR: ${e}`);
+              throw new Error(`Post-restore verification failed with ${errors.length} error(s).`);
             }
-            console.log('Database verification PASSED.');
-            return { warnings, sourceStorageObjects, sourceVaultSecrets, customLoginRoles };
+            console.log('Post-restore database verification PASSED.');
           }
 
           async function main() {
-            console.log(`SOURCE backup slug: [${sourceSlug}]`);
-            console.log(`TARGET logical slug: [${targetSlug}]`);
-            if (sourceSlug === targetSlug) {
-              console.log('INFO: source_slug equals target_slug. This is allowed in v3; the workflow will NOT overwrite the live database. It will auto-select a clean shadow target (for example -green/-restore/-dr).');
+            console.log(`RESTORE suffix: [${suffix}]`);
+            console.log(`Requested backup file: [${requestedFile || 'LATEST COMPLETE'}]`);
+            console.log('Mode is AUTO: same D1 suffix is the restore destination. No shadow/green suffix is required.');
+
+            const target = await loadTarget();
+            await psql(target.dbUrl, 'SELECT 1;');
+            const { name, manifest } = await downloadAndVerifyBackup();
+            const state = await inspectTarget(target.dbUrl);
+
+            if (state.clean) {
+              console.log('Target is CLEAN/NEW. Running full official Supabase logical restore (roles + schema + data).');
+              await restoreCleanTarget(target.dbUrl, manifest);
+            } else {
+              console.log(`Target already contains data: ${state.dirty.join(', ')}`);
+              console.log('Existing-target mode: safety backup -> schema compatibility check -> transactional data rollback.');
+              const safety = await createSafetyBackup(target.dbUrl);
+              await restoreExistingCompatibleTarget(target.dbUrl, manifest, safety.currentSchemaFile);
             }
-            console.log('AUTO MODE: latest complete backup + automatic clean-target discovery + restore + verification. No D1 production cutover is performed by this workflow.');
 
-            const resolvedTarget = await resolveCleanTarget(targetSlug);
-            const { name, manifest } = await selectAndDownloadBackup();
-            console.log(`AUTO SELECTED backup: ${name}`);
-            console.log(`AUTO SELECTED clean target: [${resolvedTarget.actualSlug}] for logical destination [${targetSlug}]`);
-
-            await assertCleanTarget(resolvedTarget.url);
-            await restoreIntoCleanTarget(resolvedTarget.url, manifest);
-            const verification = await verifyTarget(resolvedTarget.url, manifest);
-
-            console.log('RESTORE+VERIFY SUCCESS.');
-            console.log(`Backup source [${sourceSlug}] has been restored into clean target [${resolvedTarget.actualSlug}] for logical destination [${targetSlug}].`);
-            console.log('The live/production D1 row was NOT swapped or changed. This preserves the current production database until a separate cutover is approved.');
-            if (verification.warnings.length) {
-              console.warn(`Completed with ${verification.warnings.length} external/project-level warning(s); review them before routing production traffic to the restored target.`);
-            }
+            await verifyTarget(target.dbUrl, manifest);
+            console.log('RESTORE SUCCESS: database restore and verification completed.');
+            console.log(`Target D1 suffix: [${suffix}] | Backup: [${name}] | Backup source: [${manifest.source_slug || 'unknown'}]`);
           }
 
           main().catch(err => {
@@ -561,11 +745,11 @@ jobs:
             process.exit(1);
           });
           NODE
-          node restore_bluegreen.js
+          node restore_direct_v4.js
 
-      - name: Cleanup local credentials and restore files
+      - name: Cleanup local credentials and work files
         if: always()
         run: |
           set +e
           rm -f ~/.config/rclone/rclone.conf
-          rm -rf restore_work restore_bluegreen.js
+          rm -rf restore_work safety_work restore_direct_v4.js
