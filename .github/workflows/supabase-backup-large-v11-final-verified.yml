@@ -3,7 +3,7 @@ name: sao_luu_moi_nhat_v11_final_verified
 on:
   schedule:
     # 05:00 UTC (12:00 VN) and 18:00 UTC (01:00 VN next day)
-    - cron: '0 5,18 * * *'
+    - cron: '17 4,14 * * *'
   workflow_dispatch:
     inputs:
       truong_slug:
