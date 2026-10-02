@@ -1,63 +1,15 @@
-name: Supabase CLI Restore to Clean Project - BlueGreen v1
+name: Supabase CLI Restore Simple - Source to Clean Target v2
 
 on:
   workflow_dispatch:
     inputs:
-      operation:
-        description: 'restore_verify | restore_verify_cutover | verify_cutover_only | rollback_swap'
-        required: true
-        default: 'restore_verify'
-        type: choice
-        options:
-          - restore_verify
-          - restore_verify_cutover
-          - verify_cutover_only
-          - rollback_swap
-      production_slug:
-        description: 'Slug logic dang phuc vu production trong D1'
+      source_slug:
+        description: 'Slug NGUON: thu muc backup tren R2 can phuc hoi (he thong tu chon ban backup hoan chinh moi nhat)'
         required: true
         type: string
-      clean_target_slug:
-        description: 'Slug D1 tro toi Supabase project/database SACH dung lam Blue/Green target'
+      target_slug:
+        description: 'Slug DICH: dong trong D1 tro toi Supabase project/database SACH de nhan ban phuc hoi'
         required: true
-        type: string
-      backup_source_slug:
-        description: 'Slug thu muc backup tren R2; co the khac production_slug'
-        required: false
-        type: string
-      backup_file:
-        description: 'latest hoac ten bundle .tar.gz (chap nhan ca .sha256/.manifest.json/path)'
-        required: false
-        default: 'latest'
-        type: string
-      allow_cross_school_restore:
-        description: 'Bat buoc true neu backup_source_slug khac production_slug'
-        required: true
-        default: false
-        type: boolean
-      storage_objects_migrated:
-        description: 'Xac nhan file/object Supabase Storage da duoc migrate rieng neu backup nguon co Storage objects'
-        required: true
-        default: false
-        type: boolean
-      encryption_root_key_migrated:
-        description: 'Xac nhan encryption root key/Vault da duoc xu ly neu nguon co Vault secrets'
-        required: true
-        default: false
-        type: boolean
-      custom_role_passwords_configured:
-        description: 'Xac nhan password cho custom LOGIN roles da duoc cau hinh neu co'
-        required: true
-        default: false
-        type: boolean
-      external_supabase_settings_configured:
-        description: 'Xac nhan Auth settings/API keys/Edge Functions/other project settings can thiet da san sang truoc cutover'
-        required: true
-        default: false
-        type: boolean
-      confirm_production_slug:
-        description: 'Chi can cho cutover/rollback: nhap lai CHINH XAC production_slug'
-        required: false
         type: string
 
 defaults:
@@ -68,7 +20,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: supabase-db-bluegreen-${{ github.repository }}
+  group: supabase-db-restore-simple-${{ github.repository }}
   cancel-in-progress: false
 
 env:
@@ -129,23 +81,14 @@ jobs:
           EOF
           chmod 600 ~/.config/rclone/rclone.conf
 
-      - name: Restore, verify and optional atomic D1 cutover
+      - name: Auto restore latest backup to clean target and verify
         env:
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CF_D1_DB_ID: ${{ secrets.CF_D1_DB_ID }}
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          OPERATION: ${{ github.event.inputs.operation }}
-          PRODUCTION_SLUG: ${{ github.event.inputs.production_slug }}
-          CLEAN_TARGET_SLUG: ${{ github.event.inputs.clean_target_slug }}
-          BACKUP_SOURCE_SLUG: ${{ github.event.inputs.backup_source_slug }}
-          BACKUP_FILE: ${{ github.event.inputs.backup_file }}
-          ALLOW_CROSS: ${{ github.event.inputs.allow_cross_school_restore }}
-          STORAGE_OBJECTS_MIGRATED: ${{ github.event.inputs.storage_objects_migrated }}
-          ENCRYPTION_ROOT_KEY_MIGRATED: ${{ github.event.inputs.encryption_root_key_migrated }}
-          CUSTOM_ROLE_PASSWORDS_CONFIGURED: ${{ github.event.inputs.custom_role_passwords_configured }}
-          EXTERNAL_SETTINGS_CONFIGURED: ${{ github.event.inputs.external_supabase_settings_configured }}
-          CONFIRM_PRODUCTION_SLUG: ${{ github.event.inputs.confirm_production_slug }}
+          SOURCE_SLUG: ${{ github.event.inputs.source_slug }}
+          TARGET_SLUG: ${{ github.event.inputs.target_slug }}
         run: |
           set -euo pipefail
           cat > restore_bluegreen.js <<'NODE'
@@ -161,37 +104,18 @@ jobs:
           const prefix = process.env.BACKUP_PREFIX || 'database_backups_cli';
           const expectedFormat = process.env.BACKUP_FORMAT || 'supabase-cli-r2-v1';
 
-          const operation = (process.env.OPERATION || 'restore_verify').trim();
-          const productionSlug = (process.env.PRODUCTION_SLUG || '').trim();
-          const cleanTargetSlug = (process.env.CLEAN_TARGET_SLUG || '').trim();
-          const backupSourceSlug = (process.env.BACKUP_SOURCE_SLUG || '').trim();
-          const backupFileInput = (process.env.BACKUP_FILE || 'latest').trim();
-          const allowCross = String(process.env.ALLOW_CROSS || 'false') === 'true';
-          const storageMigrated = String(process.env.STORAGE_OBJECTS_MIGRATED || 'false') === 'true';
-          const rootKeyMigrated = String(process.env.ENCRYPTION_ROOT_KEY_MIGRATED || 'false') === 'true';
-          const rolePasswordsConfigured = String(process.env.CUSTOM_ROLE_PASSWORDS_CONFIGURED || 'false') === 'true';
-          const externalSettingsConfigured = String(process.env.EXTERNAL_SETTINGS_CONFIGURED || 'false') === 'true';
-          const confirmProduction = (process.env.CONFIRM_PRODUCTION_SLUG || '').trim();
-
-          const restoreOps = new Set(['restore_verify', 'restore_verify_cutover', 'verify_cutover_only']);
-          const cutoverOps = new Set(['restore_verify_cutover', 'verify_cutover_only']);
-          const allOps = new Set([...restoreOps, 'rollback_swap']);
+          const sourceSlug = (process.env.SOURCE_SLUG || '').trim();
+          const targetSlug = (process.env.TARGET_SLUG || '').trim();
+          const backupSourceSlug = sourceSlug;
+          const backupFileInput = 'latest';
 
           if (!cfAccountId || !cfApiToken || !cfDbId) throw new Error('Missing Cloudflare D1 secrets.');
-          if (!bucket && operation !== 'rollback_swap') throw new Error('Missing R2_BUCKET_NAME.');
-          if (!allOps.has(operation)) throw new Error(`Unsupported operation: ${operation}`);
-          for (const [name, value] of [['production_slug', productionSlug], ['clean_target_slug', cleanTargetSlug]]) {
+          if (!bucket) throw new Error('Missing R2_BUCKET_NAME.');
+          for (const [name, value] of [['source_slug', sourceSlug], ['target_slug', targetSlug]]) {
             if (!/^[A-Za-z0-9_-]+$/.test(value)) throw new Error(`${name} is invalid.`);
           }
-          if (productionSlug === cleanTargetSlug) throw new Error('production_slug and clean_target_slug must be different D1 rows.');
-          if (operation !== 'rollback_swap') {
-            if (!/^[A-Za-z0-9_-]+$/.test(backupSourceSlug)) throw new Error('backup_source_slug is required and invalid.');
-            if (backupSourceSlug !== productionSlug && !allowCross) {
-              throw new Error(`Cross-school restore requires allow_cross_school_restore=true: source=[${backupSourceSlug}], production=[${productionSlug}].`);
-            }
-          }
-          if ((cutoverOps.has(operation) || operation === 'rollback_swap') && confirmProduction !== productionSlug) {
-            throw new Error('confirm_production_slug must exactly match production_slug for cutover/rollback.');
+          if (sourceSlug === targetSlug) {
+            throw new Error('source_slug and target_slug must be different. target_slug must point to a clean Supabase project/database.');
           }
 
           const managedSchemas = new Set([
@@ -248,32 +172,15 @@ jobs:
             return { rows: block.results || [], meta: block.meta || {} };
           }
 
-          async function loadD1Targets() {
+          async function loadTargetUrl() {
             const { rows } = await d1Query(
-              'SELECT slug, supabase_sql FROM danh_sach_truong WHERE slug IN (?, ?) ORDER BY slug',
-              [productionSlug, cleanTargetSlug]
+              'SELECT slug, supabase_sql FROM danh_sach_truong WHERE slug = ? LIMIT 1',
+              [targetSlug]
             );
-            const map = new Map(rows.map(r => [String(r.slug), String(r.supabase_sql || '')]));
-            const productionUrl = map.get(productionSlug) || '';
-            const cleanUrl = map.get(cleanTargetSlug) || '';
-            if (!productionUrl) throw new Error(`D1 has no usable supabase_sql for production_slug [${productionSlug}].`);
-            if (!cleanUrl) throw new Error(`D1 has no usable supabase_sql for clean_target_slug [${cleanTargetSlug}].`);
-            if (productionUrl === cleanUrl) throw new Error('Production and clean target currently point to the same database URL.');
-            return { productionUrl, cleanUrl };
-          }
-
-          async function atomicSwapD1(productionUrl, cleanUrl) {
-            const sql = `UPDATE danh_sach_truong
-              SET supabase_sql = CASE slug WHEN ? THEN ? WHEN ? THEN ? ELSE supabase_sql END
-              WHERE slug IN (?, ?);`;
-            const { meta } = await d1Query(sql, [productionSlug, cleanUrl, cleanTargetSlug, productionUrl, productionSlug, cleanTargetSlug]);
-            if (meta.changes !== undefined && Number(meta.changes) < 2) throw new Error(`D1 cutover changed only ${meta.changes} row(s); expected 2.`);
-            const { rows } = await d1Query('SELECT slug, supabase_sql FROM danh_sach_truong WHERE slug IN (?, ?)', [productionSlug, cleanTargetSlug]);
-            const map = new Map(rows.map(r => [String(r.slug), String(r.supabase_sql || '')]));
-            if (map.get(productionSlug) !== cleanUrl || map.get(cleanTargetSlug) !== productionUrl) {
-              throw new Error('D1 post-cutover verification failed.');
+            if (!rows.length || !String(rows[0].supabase_sql || '')) {
+              throw new Error(`D1 has no usable supabase_sql for target_slug [${targetSlug}].`);
             }
-            console.log(`D1 SWAP OK: [${productionSlug}] now points to restored target; [${cleanTargetSlug}] retains the previous production DB for rollback.`);
+            return String(rows[0].supabase_sql);
           }
 
           function pgEnvFromUrl(dbUrl) {
@@ -568,13 +475,13 @@ jobs:
             const sourceStorageObjects = Number(manifest.verification?.storage_objects_count || 0);
             const sourceVaultSecrets = Number(manifest.verification?.vault_secrets_count || 0);
             const customLoginRoles = manifest.verification?.custom_login_roles || [];
-            if (sourceStorageObjects > 0 && !storageMigrated) warnings.push(`source has ${sourceStorageObjects} Storage object metadata row(s); actual object files are not in this DB backup`);
-            if (sourceVaultSecrets > 0 && !rootKeyMigrated) warnings.push(`source has ${sourceVaultSecrets} Vault secret row(s); logical restore does not include the encryption root key`);
-            if (customLoginRoles.length && !rolePasswordsConfigured) warnings.push(`custom LOGIN roles require passwords: ${customLoginRoles.join(', ')}`);
-            if (!externalSettingsConfigured) warnings.push('external Supabase project settings are not confirmed (Auth settings/API keys/Edge Functions/etc.)');
+            if (sourceStorageObjects > 0) warnings.push(`source has ${sourceStorageObjects} Storage object metadata row(s); actual Storage files are not included in this database logical backup`);
+            if (sourceVaultSecrets > 0) warnings.push(`source has ${sourceVaultSecrets} Vault secret row(s); logical restore does not transfer the source encryption root key`);
+            if (customLoginRoles.length) warnings.push(`custom LOGIN roles may require passwords to be configured separately: ${customLoginRoles.join(', ')}`);
+            warnings.push('Auth settings/API keys/Edge Functions and other project-level settings are outside this database logical restore and should be checked separately.');
 
             if (warnings.length) {
-              console.warn('CUTOVER BLOCKERS/WARNINGS:');
+              console.warn('RESTORE WARNINGS (database restore itself may still be valid):');
               for (const w of warnings) console.warn(`  - ${w}`);
             }
             if (errors.length) {
@@ -586,44 +493,24 @@ jobs:
             return { warnings, sourceStorageObjects, sourceVaultSecrets, customLoginRoles };
           }
 
-          function assertCutoverReady(verification) {
-            const blockers = [];
-            if (verification.sourceStorageObjects > 0 && !storageMigrated) blockers.push('Storage object files not confirmed migrated');
-            if (verification.sourceVaultSecrets > 0 && !rootKeyMigrated) blockers.push('encryption root key/Vault not confirmed migrated');
-            if (verification.customLoginRoles.length && !rolePasswordsConfigured) blockers.push('custom LOGIN role passwords not confirmed configured');
-            if (!externalSettingsConfigured) blockers.push('external Supabase project settings not confirmed configured');
-            if (blockers.length) throw new Error(`CUTOVER BLOCKED: ${blockers.join('; ')}. Restore target remains isolated and production D1 is unchanged.`);
-          }
-
           async function main() {
-            const { productionUrl, cleanUrl } = await loadD1Targets();
+            console.log(`SOURCE slug: [${sourceSlug}]`);
+            console.log(`TARGET slug: [${targetSlug}]`);
+            console.log('AUTO MODE: selecting latest complete backup; restore+verify only; no D1 cutover will be performed.');
 
-            if (operation === 'rollback_swap') {
-              console.warn(`ROLLBACK SWAP requested: [${productionSlug}] <-> [${cleanTargetSlug}]`);
-              await atomicSwapD1(productionUrl, cleanUrl);
-              return;
-            }
+            const targetUrl = await loadTargetUrl();
+            const { name, manifest } = await selectAndDownloadBackup();
+            console.log(`AUTO SELECTED backup: ${name}`);
 
-            const { manifest } = await selectAndDownloadBackup();
-            if (backupSourceSlug !== productionSlug) {
-              console.warn(`CROSS-SCHOOL RESTORE authorized: backup [${backupSourceSlug}] -> logical production [${productionSlug}] via clean target [${cleanTargetSlug}].`);
-            }
+            await assertCleanTarget(targetUrl);
+            await restoreIntoCleanTarget(targetUrl, manifest);
+            const verification = await verifyTarget(targetUrl, manifest);
 
-            if (operation === 'restore_verify' || operation === 'restore_verify_cutover') {
-              await assertCleanTarget(cleanUrl);
-              await restoreIntoCleanTarget(cleanUrl, manifest);
-            } else {
-              console.log('verify_cutover_only: skipping restore; verifying the already-restored clean target.');
-            }
-
-            const verification = await verifyTarget(cleanUrl, manifest);
-
-            if (cutoverOps.has(operation)) {
-              assertCutoverReady(verification);
-              console.warn(`CUTOVER: D1 [${productionSlug}] will point to the verified clean target; previous production URL will move to [${cleanTargetSlug}] as rollback slot.`);
-              await atomicSwapD1(productionUrl, cleanUrl);
-            } else {
-              console.log('RESTORE+VERIFY complete. No cutover requested; production D1 remains unchanged.');
+            console.log('RESTORE+VERIFY SUCCESS.');
+            console.log(`Backup source [${sourceSlug}] has been restored into clean target [${targetSlug}].`);
+            console.log('The D1 target row was NOT swapped or changed; production cutover remains a separate administrative action.');
+            if (verification.warnings.length) {
+              console.warn(`Completed with ${verification.warnings.length} external/project-level warning(s); review them before routing production traffic to the target.`);
             }
           }
 
