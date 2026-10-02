@@ -1,4 +1,4 @@
-name: Supabase CLI Restore Direct v4 - suffix + optional backup file
+name: Supabase CLI Restore Direct v5 - safe in-place sequences
 
 on:
   workflow_dispatch:
@@ -93,7 +93,7 @@ jobs:
           INPUT_BACKUP_FILE: ${{ github.event.inputs.backup_file }}
         run: |
           set -euo pipefail
-          cat > restore_direct_v4.js <<'NODE'
+          cat > restore_direct_v5.js <<'NODE'
           const fs = require('fs');
           const path = require('path');
           const crypto = require('crypto');
@@ -633,13 +633,50 @@ jobs:
             }
             if (!uniqueTables.length) throw new Error('Backup contains no COPY tables; refusing in-place destructive restore.');
 
+            // IMPORTANT for an existing Supabase project:
+            // Do NOT use RESTART IDENTITY here. Supabase-managed sequences (for example
+            // auth.refresh_tokens_id_seq) are owned by reserved service roles, so the
+            // normal postgres connection may TRUNCATE the table but is not allowed to
+            // ALTER/RESTART the managed sequence. CONTINUE IDENTITY is also safer for
+            // a rollback to an older snapshot because sequence high-water marks are
+            // preserved instead of being moved backwards.
             const truncateSql = [
               "SET lock_timeout = '30s';",
               "SET statement_timeout = '0';",
               'SET session_replication_role = replica;',
-              `TRUNCATE TABLE ${uniqueTables.map(quoteQualified).join(', ')} RESTART IDENTITY;`
+              `TRUNCATE TABLE ${uniqueTables.map(quoteQualified).join(', ')} CONTINUE IDENTITY;`
             ].join('\n') + '\n';
             fs.writeFileSync('restore_work/truncate.sql', truncateSql);
+
+            // pg_dump data-only files can contain SELECT pg_catalog.setval(...).
+            // During an in-place rollback we intentionally preserve the target's
+            // current sequence high-water marks. This avoids permission errors on
+            // Supabase-managed sequences and prevents an older backup from moving a
+            // live sequence backwards. Clean/new-project restore still uses the
+            // original data.sql unchanged.
+            function makeInPlaceDataFile(inputFile, outputFile) {
+              const lines = fs.readFileSync(inputFile, 'utf8').split(/\r?\n/);
+              let removed = 0;
+              const out = lines.map(line => {
+                if (/^\s*SELECT\s+pg_catalog\.setval\s*\(/i.test(line)) {
+                  removed++;
+                  return `-- in-place restore v5: preserved target sequence state; skipped: ${line}`;
+                }
+                return line;
+              });
+              fs.writeFileSync(outputFile, out.join('\n'));
+              return removed;
+            }
+
+            const inPlaceData = path.resolve('restore_work/data_inplace.sql');
+            let skippedSetvals = makeInPlaceDataFile('restore_work/data.sql', inPlaceData);
+            let inPlaceHistoryData = null;
+            if (manifest.has_migration_history && fs.existsSync('restore_work/history_data.sql')) {
+              inPlaceHistoryData = path.resolve('restore_work/history_data_inplace.sql');
+              skippedSetvals += makeInPlaceDataFile('restore_work/history_data.sql', inPlaceHistoryData);
+            }
+            console.log(`In-place sequence protection: CONTINUE IDENTITY; skipped ${skippedSetvals} pg_dump setval statement(s).`);
+
             const realtimeFile = path.resolve('restore_work/realtime.sql');
             await makeRealtimeSql(manifest, dbUrl, realtimeFile);
 
@@ -649,9 +686,9 @@ jobs:
               '--command',"SET statement_timeout = '0'",
               '--command','SET session_replication_role = replica',
               '--file',path.resolve('restore_work/truncate.sql'),
-              '--file',path.resolve('restore_work/data.sql')
+              '--file',inPlaceData
             ];
-            if (manifest.has_migration_history && fs.existsSync('restore_work/history_data.sql')) args.push('--file',path.resolve('restore_work/history_data.sql'));
+            if (inPlaceHistoryData) args.push('--file',inPlaceHistoryData);
             args.push('--file', realtimeFile);
 
             let lastErr;
@@ -745,11 +782,11 @@ jobs:
             process.exit(1);
           });
           NODE
-          node restore_direct_v4.js
+          node restore_direct_v5.js
 
       - name: Cleanup local credentials and work files
         if: always()
         run: |
           set +e
           rm -f ~/.config/rclone/rclone.conf
-          rm -rf restore_work safety_work restore_direct_v4.js
+          rm -rf restore_work safety_work restore_direct_v5.js
