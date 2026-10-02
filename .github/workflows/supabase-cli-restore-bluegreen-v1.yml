@@ -1,4 +1,4 @@
-name: Supabase CLI Restore Direct v6 - transactional compatibility restore
+name: Supabase CLI Restore Direct v7 - transactional compatibility restore
 
 on:
   workflow_dispatch:
@@ -53,11 +53,25 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y postgresql-client curl ca-certificates
-          curl -fsSL https://rclone.org/install.sh | sudo bash
+          sudo apt-get install -y curl ca-certificates
+
+          # Install PostgreSQL client 17 to match the Supabase Postgres 17 dump environment.
+          sudo install -d -m 0755 /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          sudo sh -c "printf '%s\n' 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+          # Avoid a pipe here. With set -o pipefail, 'rclone version | head -n 1' can exit 141 (SIGPIPE)
+          # after head exits early even though rclone itself installed correctly.
+          curl -fsSL https://rclone.org/install.sh -o /tmp/install-rclone.sh
+          sudo bash /tmp/install-rclone.sh
+          rm -f /tmp/install-rclone.sh
+
           supabase --version
           psql --version
-          rclone version | head -n 1
+          rclone version
 
       - name: Configure Cloudflare R2
         env:
@@ -93,7 +107,7 @@ jobs:
           INPUT_BACKUP_FILE: ${{ github.event.inputs.backup_file }}
         run: |
           set -euo pipefail
-          cat > restore_direct_v6.js <<'NODE'
+          cat > restore_direct_v7.js <<'NODE'
           const fs = require('fs');
           const path = require('path');
           const crypto = require('crypto');
@@ -680,7 +694,7 @@ jobs:
               const after = before.split(/\r?\n/).map(line => {
                 if (!/^\s*--/.test(line) && matcher(line)) {
                   changed++;
-                  return `-- v6 compatibility (${reason}): ${line}`;
+                  return `-- v7 compatibility (${reason}): ${line}`;
                 }
                 return line;
               }).join('\n');
@@ -730,8 +744,8 @@ jobs:
             console.log(`Schema fingerprint backup=${backupFp}`);
             console.log(`Schema fingerprint target=${currentFp}`);
             if (backupFp !== currentFp) {
-              console.warn('Schema dump fingerprints differ. v6 does NOT treat a raw schema.sql hash mismatch as proof of incompatibility because separate Supabase projects can produce different dump text for platform/environment details.');
-              console.warn('v6 will instead run a structural COPY-column preflight, then let PostgreSQL validate the actual data load inside one transaction. Any incompatibility causes a full rollback.');
+              console.warn('Schema dump fingerprints differ. v7 does NOT treat a raw schema.sql hash mismatch as proof of incompatibility because separate Supabase projects can produce different dump text for platform/environment details.');
+              console.warn('v7 will instead run a structural COPY-column preflight, then let PostgreSQL validate the actual data load inside one transaction. Any incompatibility causes a full rollback.');
             } else {
               console.log('Schema dump fingerprints are identical.');
             }
@@ -770,7 +784,7 @@ jobs:
               const out = lines.map(line => {
                 if (/^\s*SELECT\s+pg_catalog\.setval\s*\(/i.test(line)) {
                   removed++;
-                  return `-- in-place restore v6: preserved target sequence state; skipped: ${line}`;
+                  return `-- in-place restore v7: preserved target sequence state; skipped: ${line}`;
                 }
                 return line;
               });
@@ -898,11 +912,11 @@ jobs:
             process.exit(1);
           });
           NODE
-          node restore_direct_v6.js
+          node restore_direct_v7.js
 
       - name: Cleanup local credentials and work files
         if: always()
         run: |
           set +e
           rm -f ~/.config/rclone/rclone.conf
-          rm -rf restore_work safety_work restore_direct_v6.js
+          rm -rf restore_work safety_work restore_direct_v7.js
