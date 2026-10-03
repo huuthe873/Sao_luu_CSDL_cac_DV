@@ -1,4 +1,4 @@
-name: sao_luu_moi_nhat_02.10
+name: sao_luu_moi_nhat_v13_03.10
 
 on:
   schedule:
@@ -115,6 +115,24 @@ jobs:
           const cfDbId = process.env.CF_D1_DB_ID || '';
           const inputSlug = (process.env.INPUT_SLUG || '').trim();
           const backupFormat = process.env.BACKUP_FORMAT || 'supabase-cli-r2-v1';
+          const restoreGuardSchema = '_supabase_backup_restore_internal';
+          const restoreGuardComment = 'Internal commit marker for automated Supabase backup/restore workflow';
+          const filenameFamily = 'vn-ms-run-v2';
+
+          function numericEnv(name) {
+            const v = String(process.env[name] || '').trim();
+            return /^\d+$/.test(v) ? v : '';
+          }
+
+          // A filename must be unique even when another repository targets the same R2 bucket/slug.
+          // GitHub concurrency only serializes runs inside this repository, so timestamp-only names are
+          // insufficient. Repository ID + run ID + run attempt is stable, traceable and collision-safe.
+          const githubRepositoryId = numericEnv('GITHUB_REPOSITORY_ID');
+          const githubRunId = numericEnv('GITHUB_RUN_ID');
+          const githubRunAttempt = numericEnv('GITHUB_RUN_ATTEMPT') || '1';
+          const backupRunToken = githubRepositoryId && githubRunId
+            ? `gh${githubRepositoryId}-${githubRunId}-a${githubRunAttempt}`
+            : `local-${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
 
           if (!cfAccountId || !cfApiToken || !cfDbId) {
             console.error('ERROR: Missing Cloudflare D1 secrets.');
@@ -124,12 +142,13 @@ jobs:
             console.error('ERROR: truong_slug contains unsupported characters.');
             process.exit(1);
           }
+          console.log(`BACKUP NAMING: family=${filenameFamily}; run_token=${backupRunToken}`);
 
           const managedSchemas = new Set([
             'auth', 'storage', 'realtime', 'graphql', 'graphql_public',
             'extensions', 'pgbouncer', 'pgsodium', 'pgsodium_masks',
             'vault', 'cron', 'supabase_functions', 'supabase_migrations',
-            'net', '_realtime', '_analytics'
+            'net', '_realtime', '_analytics', restoreGuardSchema
           ]);
 
           function safeError(err) {
@@ -284,6 +303,23 @@ jobs:
             throw lastErr;
           }
 
+          function sqlLiteral(value) { return "'" + String(value).replace(/'/g, "''") + "'"; }
+
+          async function cleanupOwnedRestoreGuard(dbUrl) {
+            const state = (await psql(dbUrl, `
+              SELECT CASE
+                WHEN to_regnamespace(${sqlLiteral(restoreGuardSchema)}) IS NULL THEN 'absent'
+                WHEN COALESCE(obj_description(to_regnamespace(${sqlLiteral(restoreGuardSchema)}), 'pg_namespace'), '') = ${sqlLiteral(restoreGuardComment)} THEN 'owned'
+                ELSE 'conflict'
+              END;`)).trim();
+            if (state === 'absent') return;
+            if (state !== 'owned') {
+              throw new Error(`Reserved internal schema ${restoreGuardSchema} exists but is not owned by this workflow. Refusing backup until the conflict is resolved.`);
+            }
+            await psql(dbUrl, `DROP SCHEMA IF EXISTS "${restoreGuardSchema}" CASCADE;`);
+            console.log(`[maintenance] Removed committed restore-marker schema before backup.`);
+          }
+
           async function relationExists(dbUrl, regclass) {
             const escaped = regclass.replace(/'/g, "''");
             return (await psql(dbUrl, `SELECT CASE WHEN to_regclass('${escaped}') IS NULL THEN '0' ELSE '1' END;`)) === '1';
@@ -308,6 +344,21 @@ jobs:
               fs.closeSync(fd);
             }
             return h.digest('hex');
+          }
+
+          function dumpSemanticFingerprint(file) {
+            // Preserve SQL byte semantics. The only ignored lines are PostgreSQL 17 pg_dump
+            // random \restrict/\unrestrict guards, which change between otherwise identical dumps.
+            // Do NOT trim comments, literals or whitespace inside SQL: those can be semantically meaningful.
+            const text = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+            const canonical = text.split('\n')
+              .filter(line => !/^\s*\\(?:un)?restrict\b/i.test(line))
+              .join('\n');
+            return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
+          }
+
+          function schemaFingerprint(file) {
+            return dumpSemanticFingerprint(file);
           }
 
           function parseQualifiedName(raw) {
@@ -399,8 +450,9 @@ jobs:
           }
 
           function vietnamFileStamp(date = new Date()) {
-            // Short operator-friendly filename time in Vietnam local time (UTC+7):
-            // HH-MM-SS_DD-MM-YYYY, e.g. 05-08-09_12-09-2026.
+            // Millisecond precision reduces accidental same-time collisions and gives deterministic
+            // latest ordering. The run token below provides the hard uniqueness guarantee.
+            // HH-MM-SS-mmm_DD-MM-YYYY, e.g. 05-08-09-137_12-09-2026.
             const parts = new Intl.DateTimeFormat('en-GB', {
               timeZone: 'Asia/Ho_Chi_Minh',
               year: 'numeric', month: '2-digit', day: '2-digit',
@@ -408,7 +460,8 @@ jobs:
               hourCycle: 'h23'
             }).formatToParts(date);
             const p = Object.fromEntries(parts.filter(x => x.type !== 'literal').map(x => [x.type, x.value]));
-            return `${p.hour}-${p.minute}-${p.second}_${p.day}-${p.month}-${p.year}`;
+            const ms = String(date.getUTCMilliseconds()).padStart(3, '0');
+            return `${p.hour}-${p.minute}-${p.second}-${ms}_${p.day}-${p.month}-${p.year}`;
           }
 
           async function backupOne(row) {
@@ -416,23 +469,38 @@ jobs:
             const dbUrl = String(row.supabase_sql || '').trim();
             if (!/^[A-Za-z0-9_-]+$/.test(slug)) throw new Error(`Invalid slug from D1: ${slug}`);
             if (!dbUrl) throw new Error(`[${slug}] Missing supabase_sql.`);
+            await cleanupOwnedRestoreGuard(dbUrl);
 
             const stamp = vietnamFileStamp();
-            const base = `${slug}_${stamp}`;
+            const base = `${slug}_${stamp}_${backupRunToken}`;
             const dir = path.join('backups_cli', slug, base);
             fs.mkdirSync(dir, { recursive: true });
 
             const roles = path.join(dir, 'roles.sql');
+            const rolesAfter = path.join(dir, 'roles_after.sql');
             const schema = path.join(dir, 'schema.sql');
+            const schemaAfter = path.join(dir, 'schema_after.sql');
             const data = path.join(dir, 'data.sql');
             const histSchema = path.join(dir, 'history_schema.sql');
             const histData = path.join(dir, 'history_data.sql');
+            const histDataBefore = path.join(dir, 'history_data_before.sql');
+            const histDataAfter = path.join(dir, 'history_data_after.sql');
             const manifestPath = path.join(dir, 'manifest.json');
             const bundle = path.join('backups_cli', slug, `${base}.tar.gz`);
             const sideManifest = `${bundle}.manifest.json`;
             const shaFile = `${bundle}.sha256`;
 
             console.log(`\n=== BACKUP [${slug}] ===`);
+
+            // If migration history exists, capture a pre-dump probe. Migration records are part of
+            // the logical state: a DML-only migration can change data without changing schema.sql.
+            // Publishing data from one snapshot with a newer migration-history table could cause a
+            // future `supabase db push` to skip a migration that is not actually represented in the backup.
+            const migrationHistoryExistedBefore = await relationExists(dbUrl, 'supabase_migrations.schema_migrations');
+            if (migrationHistoryExistedBefore) {
+              await dumpWithRetry(dbUrl, histDataBefore, ['--use-copy', '--data-only', '--schema', 'supabase_migrations'], `[${slug}] migration-history pre-dump stability probe`);
+            }
+
             await dumpWithRetry(dbUrl, roles, ['--role-only'], `[${slug}] roles dump`);
             await dumpWithRetry(dbUrl, schema, [], `[${slug}] schema dump`);
             await dumpWithRetry(dbUrl, data, ['--use-copy', '--data-only', '-x', 'storage.buckets_vectors', '-x', 'storage.vector_indexes'], `[${slug}] data dump`);
@@ -442,16 +510,48 @@ jobs:
             }
 
             let hasMigrationHistory = false;
-            if (await relationExists(dbUrl, 'supabase_migrations.schema_migrations')) {
-              try {
-                await dumpWithRetry(dbUrl, histSchema, ['--schema', 'supabase_migrations'], `[${slug}] migration schema dump`);
-                await dumpWithRetry(dbUrl, histData, ['--use-copy', '--data-only', '--schema', 'supabase_migrations'], `[${slug}] migration data dump`);
-                hasMigrationHistory = fs.existsSync(histSchema) && fs.existsSync(histData) && fs.statSync(histSchema).size > 0;
-              } catch (e) {
-                console.warn(`[${slug}] WARNING: Could not preserve migration history: ${safeError(e)}`);
-                for (const f of [histSchema, histData]) if (fs.existsSync(f)) fs.rmSync(f, { force: true });
+            if (migrationHistoryExistedBefore) {
+              // Once the table is known to exist, preservation is a hard requirement. Silently
+              // dropping migration history would make the restore operationally inconsistent.
+              await dumpWithRetry(dbUrl, histSchema, ['--schema', 'supabase_migrations'], `[${slug}] migration schema dump`);
+              await dumpWithRetry(dbUrl, histData, ['--use-copy', '--data-only', '--schema', 'supabase_migrations'], `[${slug}] migration data dump`);
+              hasMigrationHistory = fs.existsSync(histSchema) && fs.existsSync(histData) && fs.statSync(histSchema).size > 0 && fs.statSync(histData).size > 0;
+              if (!hasMigrationHistory) throw new Error(`[${slug}] Migration history exists but could not be captured completely. Backup will NOT be published.`);
+            }
+
+            // Final stability gates run AFTER data + migration-history capture, so no migration or
+            // role/schema change can slip into history after the core consistency check.
+            await dumpWithRetry(dbUrl, schemaAfter, [], `[${slug}] schema stability verification dump`);
+            await dumpWithRetry(dbUrl, rolesAfter, ['--role-only'], `[${slug}] role stability verification dump`);
+            const schemaBeforeFp = schemaFingerprint(schema);
+            const schemaAfterFp = schemaFingerprint(schemaAfter);
+            const rolesBeforeFp = dumpSemanticFingerprint(roles);
+            const rolesAfterFp = dumpSemanticFingerprint(rolesAfter);
+            fs.rmSync(schemaAfter, { force: true });
+            fs.rmSync(rolesAfter, { force: true });
+            if (schemaBeforeFp !== schemaAfterFp) {
+              throw new Error(`[${slug}] Schema changed while this backup was being created. Backup will NOT be published. Retry when migrations/DDL are idle.`);
+            }
+            if (rolesBeforeFp !== rolesAfterFp) {
+              throw new Error(`[${slug}] Database roles changed while this backup was being created. Backup will NOT be published. Retry when role changes are idle.`);
+            }
+
+            const migrationHistoryExistsAfter = await relationExists(dbUrl, 'supabase_migrations.schema_migrations');
+            if (migrationHistoryExistsAfter !== migrationHistoryExistedBefore) {
+              throw new Error(`[${slug}] Migration-history table existence changed while backup was running. Backup will NOT be published.`);
+            }
+            if (migrationHistoryExistedBefore) {
+              await dumpWithRetry(dbUrl, histDataAfter, ['--use-copy', '--data-only', '--schema', 'supabase_migrations'], `[${slug}] migration-history post-dump stability probe`);
+              const histBeforeFp = dumpSemanticFingerprint(histDataBefore);
+              const histArchiveFp = dumpSemanticFingerprint(histData);
+              const histAfterFp = dumpSemanticFingerprint(histDataAfter);
+              fs.rmSync(histDataBefore, { force: true });
+              fs.rmSync(histDataAfter, { force: true });
+              if (histBeforeFp !== histArchiveFp || histArchiveFp !== histAfterFp) {
+                throw new Error(`[${slug}] Supabase migration history changed while this backup was being created. Backup will NOT be published. Retry when migrations are idle.`);
               }
             }
+            console.log(`[${slug}] Schema, role, and migration-history stability verification PASSED.`);
 
             const copyCounts = await parseCopyCounts(data);
             const managed = await collectManagedSignatures(dbUrl);
@@ -493,11 +593,22 @@ jobs:
               created_at_utc: new Date().toISOString(),
               filename_timestamp: stamp,
               filename_timezone: 'Asia/Ho_Chi_Minh',
+              filename_family: filenameFamily,
+              filename_run_token: backupRunToken,
+              github_repository_id: githubRepositoryId || null,
+              github_run_id: githubRunId || null,
+              github_run_attempt: githubRunAttempt || null,
               supabase_cli_version: process.env.SUPABASE_CLI_VERSION || 'unknown',
               postgres_server_version: serverVersion,
               database_size_bytes: databaseSizeBytes,
               components,
               has_migration_history: hasMigrationHistory,
+              core_dump_stability: {
+                schema_unchanged_across_data_dump: true,
+                roles_unchanged_across_data_dump: true,
+                migration_history_unchanged_across_backup: true,
+                fingerprint_method: 'exact-sql-minus-pgdump-restrict-guards'
+              },
               verification: {
                 copy_row_counts: copyCounts,
                 auth_users_count: authUsers,
@@ -634,22 +745,55 @@ jobs:
             const remoteSha = `${remoteBundle}.sha256`;
             const remoteManifest = `${remoteBundle}.manifest.json`;
             const tmp = path.join(os.tmpdir(), `${process.pid}-${bundleName}`);
+            const tmpSha = `${tmp}.sha256`;
+            const tmpManifest = `${tmp}.manifest.json`;
             console.log(`Uploading [${item.slug}] ${bundleName}`);
             const transferFlags = ['--s3-no-check-bucket', '--retries', '5', '--low-level-retries', '10', '--contimeout', '30s', '--timeout', '10m'];
+            const uploadFlags = [...transferFlags, '--immutable'];
+            const uploadedThisAttempt = [];
             try {
-              await run('rclone', ['copyto', item.bundle, remoteBundle, ...transferFlags]);
+              // IMPORTANT: never use `rclone lsjson <object> --stat` as an existence test on S3/R2.
+              // Bucket backends may report a missing object path as an empty directory with exit 0.
+              // Instead list the parent directory once and compare the exact object basename.
+              const remoteFiles = await listRemoteFiles(remoteDir);
+              const existingNames = new Set(remoteFiles.map(f => String(f.Path || f.Name || '')));
+              const candidates = [
+                [bundleName, remoteBundle],
+                [`${bundleName}.sha256`, remoteSha],
+                [`${bundleName}.manifest.json`, remoteManifest]
+              ];
+              const preexisting = candidates.filter(([name]) => existingNames.has(name)).map(([, remote]) => remote);
+              console.log(`R2 exact collision preflight [${item.slug}]: existing_objects=${existingNames.size}, candidate_hits=${preexisting.length}`);
+              if (preexisting.length) {
+                throw new Error(`Collision guard: refusing to overwrite exact pre-existing R2 backup artifact(s): ${preexisting.join(', ')}`);
+              }
+
+              // --immutable is a second no-overwrite defense in case the destination changes
+              // after the exact directory listing but before the transfer starts.
+              await run('rclone', ['copyto', item.bundle, remoteBundle, ...uploadFlags]);
+              uploadedThisAttempt.push(remoteBundle);
               await run('rclone', ['copyto', remoteBundle, tmp, ...transferFlags]);
               const remoteHash = sha256File(tmp);
-              fs.rmSync(tmp, { force: true });
               if (remoteHash !== item.bundleSha) throw new Error(`SHA-256 mismatch after R2 round trip: expected ${item.bundleSha}, got ${remoteHash}`);
-              await run('rclone', ['copyto', item.shaFile, remoteSha, ...transferFlags]);
-              await run('rclone', ['copyto', item.manifest, remoteManifest, ...transferFlags]);
-              console.log(`VERIFIED R2 [${item.slug}] ${bundleName}`);
+
+              await run('rclone', ['copyto', item.shaFile, remoteSha, ...uploadFlags]);
+              uploadedThisAttempt.push(remoteSha);
+              await run('rclone', ['copyto', item.manifest, remoteManifest, ...uploadFlags]);
+              uploadedThisAttempt.push(remoteManifest);
+              await run('rclone', ['copyto', remoteSha, tmpSha, ...transferFlags]);
+              await run('rclone', ['copyto', remoteManifest, tmpManifest, ...transferFlags]);
+              if (!fs.readFileSync(item.shaFile).equals(fs.readFileSync(tmpSha))) throw new Error('R2 .sha256 sidecar differs after round trip.');
+              if (!fs.readFileSync(item.manifest).equals(fs.readFileSync(tmpManifest))) throw new Error('R2 .manifest.json sidecar differs after round trip.');
+
+              for (const f of [tmp, tmpSha, tmpManifest]) fs.rmSync(f, { force: true });
+              console.log(`VERIFIED R2 COMPLETE SET [${item.slug}] ${bundleName}`);
               return true;
             } catch (e) {
-              fs.rmSync(tmp, { force: true });
+              for (const f of [tmp, tmpSha, tmpManifest]) fs.rmSync(f, { force: true });
               console.error(`UPLOAD FAILURE DETAIL [${item.slug}]: ${String(e.message || e).slice(0, 6000)}`);
-              for (const remote of [remoteManifest, remoteSha, remoteBundle]) {
+              // Delete only objects created by THIS upload attempt. Never delete a pre-existing
+              // valid backup set because of a filename collision or a failed overwrite attempt.
+              for (const remote of uploadedThisAttempt.slice().reverse()) {
                 try { await run('rclone', ['deletefile', remote, '--s3-no-check-bucket']); } catch (_) {}
               }
               return false;
@@ -658,7 +802,7 @@ jobs:
 
           async function listRemoteFiles(remoteDir) {
             try {
-              const { stdout } = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket']);
+              const { stdout } = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket', '--retries', '5', '--low-level-retries', '10', '--contimeout', '30s', '--timeout', '2m']);
               return JSON.parse(stdout || '[]');
             } catch (e) {
               const msg = String(e.message || e);
@@ -668,27 +812,39 @@ jobs:
           }
 
           function validVietnamStampToEpoch(stamp) {
-            const m = String(stamp || '').match(/^(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{4})$/);
+            // Accept both v12 millisecond stamps and v11 second-only stamps.
+            const m = String(stamp || '').match(/^(\d{2})-(\d{2})-(\d{2})(?:-(\d{3}))?_(\d{2})-(\d{2})-(\d{4})$/);
             if (!m) return null;
-            const [, hh, mm, ss, dd, mo, yyyy] = m.map((x, i) => i === 0 ? x : Number(x));
-            if (hh > 23 || mm > 59 || ss > 59 || mo < 1 || mo > 12 || dd < 1 || dd > 31) return null;
+            const hh = Number(m[1]), mm = Number(m[2]), ss = Number(m[3]);
+            const millis = m[4] ? Number(m[4]) : 0;
+            const dd = Number(m[5]), mo = Number(m[6]), yyyy = Number(m[7]);
+            if (hh > 23 || mm > 59 || ss > 59 || millis > 999 || mo < 1 || mo > 12 || dd < 1 || dd > 31) return null;
             // Vietnam has a fixed UTC+7 civil offset and no DST. Convert local filename time to UTC epoch.
-            const epochMs = Date.UTC(yyyy, mo - 1, dd, hh - 7, mm, ss);
+            const epochMs = Date.UTC(yyyy, mo - 1, dd, hh - 7, mm, ss, millis);
             const check = new Date(epochMs + 7 * 3600 * 1000);
             if (check.getUTCFullYear() !== yyyy || check.getUTCMonth() + 1 !== mo || check.getUTCDate() !== dd ||
-                check.getUTCHours() !== hh || check.getUTCMinutes() !== mm || check.getUTCSeconds() !== ss) return null;
+                check.getUTCHours() !== hh || check.getUTCMinutes() !== mm || check.getUTCSeconds() !== ss ||
+                check.getUTCMilliseconds() !== millis) return null;
             return epochMs;
           }
 
           function snapshotInfoForBundle(base, slug) {
             const escSlug = slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-            // Current short filename family (Vietnam local time):
-            // <slug>_<HH-MM-SS>_<DD-MM-YYYY>.tar.gz
-            let m = String(base || '').match(new RegExp(`^${escSlug}_(\\d{2}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{4})\\.tar\\.gz$`));
+            // v12 collision-safe family:
+            // <slug>_<HH-MM-SS-mmm>_<DD-MM-YYYY>_<run-token>.tar.gz
+            let m = String(base || '').match(new RegExp(`^${escSlug}_(\\d{2}-\\d{2}-\\d{2}-\\d{3}_\\d{2}-\\d{2}-\\d{4})_([A-Za-z0-9-]+)\\.tar\\.gz$`));
             if (m) {
               const epochMs = validVietnamStampToEpoch(m[1]);
-              if (epochMs !== null) return { epochMs, naming: 'short-vn', stamp: m[1] };
+              if (epochMs !== null) return { epochMs, naming: 'unique-v12', stamp: m[1], runToken: m[2] };
+            }
+
+            // Backward compatibility with v11 second-only names:
+            // <slug>_<HH-MM-SS>_<DD-MM-YYYY>.tar.gz
+            m = String(base || '').match(new RegExp(`^${escSlug}_(\\d{2}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{4})\\.tar\\.gz$`));
+            if (m) {
+              const epochMs = validVietnamStampToEpoch(m[1]);
+              if (epochMs !== null) return { epochMs, naming: 'short-vn-v11', stamp: m[1] };
             }
 
             // Backward compatibility with backups created by v7 and earlier:
@@ -724,8 +880,8 @@ jobs:
               return null;
             }
 
-            // Only touch exact backup artifacts from the current short naming family or
-            // the immediately preceding v7 family. Unrelated archives are ignored.
+            // Only touch exact backup artifacts from v12, v11, or the legacy v7 family.
+            // Unrelated archives are ignored.
             const snapshot = snapshotInfoForBundle(base, slug);
             if (!snapshot) return null;
             return { base, kind, ...snapshot };
@@ -739,8 +895,8 @@ jobs:
               .map(f => ({ file: f, info: managedArtifactInfo(String(f.Path || ''), slug) }))
               .filter(x => x.info?.kind === 'bundle')
               .filter(x => byName.has(`${x.file.Path}.sha256`) && byName.has(`${x.file.Path}.manifest.json`))
-              // Sort by the parsed snapshot time, not lexical filename order: the short filename
-              // begins with HH-MM-SS, so simple string sorting would be chronologically wrong.
+              // Sort by parsed snapshot time, not lexical filename order. v12 includes milliseconds;
+              // v11/v7 remain fully backward compatible.
               .sort((a, b) => b.info.epochMs - a.info.epochMs || String(b.file.Path).localeCompare(String(a.file.Path)))
               .map(x => x.file);
             const cutoff = Date.now() - retentionDays * 86400 * 1000;
