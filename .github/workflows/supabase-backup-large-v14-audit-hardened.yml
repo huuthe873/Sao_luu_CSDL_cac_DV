@@ -1,0 +1,1152 @@
+name: sao_luu_v14_audit_hardened
+
+on:
+  schedule:
+    # 05:00 UTC (12:00 VN) and 18:00 UTC (01:00 VN next day)
+    - cron: '0 5,18 * * *'
+  workflow_dispatch:
+    inputs:
+      truong_slug:
+        description: 'Slug truong can sao luu; de trong de sao luu toan bo'
+        required: false
+        type: string
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-db-maintenance-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  BACKUP_FORMAT: supabase-cli-r2-v1
+  BACKUP_PREFIX: database_backups
+  RETENTION_ENABLED: 'false' # Review retention dry-run and a rehearsal restore before enabling.
+  RETENTION_DAYS: '30'
+  MIN_BACKUPS_PER_SCHOOL: '3'
+  SUPABASE_CLI_VERSION: '2.117.0'
+
+jobs:
+  backup:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v3.0.1
+        with:
+          version: ${{ env.SUPABASE_CLI_VERSION }}
+
+      - name: Install PostgreSQL client and rclone
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl ca-certificates
+
+          # Pin PostgreSQL client 17 to the same major version used by the Supabase dump image.
+          sudo install -d -m 0755 /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          sudo sh -c "printf '%s\n' 'deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main' > /etc/apt/sources.list.d/pgdg.list"
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+          # Avoid curl|bash and rclone|head pipelines under set -o pipefail.
+          curl -fsSL https://rclone.org/install.sh -o /tmp/install-rclone.sh
+          sudo bash /tmp/install-rclone.sh
+          rm -f /tmp/install-rclone.sh
+
+          docker info >/dev/null
+          supabase --version
+          psql --version
+          rclone version
+
+      - name: Configure Cloudflare R2
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: |
+          set -euo pipefail
+          : "${CF_ACCOUNT_ID:?Missing CF_ACCOUNT_ID}"
+          : "${R2_ACCESS_KEY_ID:?Missing R2_ACCESS_KEY_ID}"
+          : "${R2_SECRET_ACCESS_KEY:?Missing R2_SECRET_ACCESS_KEY}"
+          mkdir -p ~/.config/rclone
+          chmod 700 ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = $R2_ACCESS_KEY_ID
+          secret_access_key = $R2_SECRET_ACCESS_KEY
+          region = auto
+          endpoint = https://$CF_ACCOUNT_ID.r2.cloudflarestorage.com
+          no_check_bucket = true
+          EOF
+          chmod 600 ~/.config/rclone/rclone.conf
+
+      - name: Create Supabase CLI backups
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_D1_DB_ID: ${{ secrets.CF_D1_DB_ID }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          INPUT_SLUG: ${{ github.event.inputs.truong_slug }}
+        run: |
+          set -euo pipefail
+          cat > upload_r2.js <<'NODE'
+          process.umask(0o077);
+          function positiveInteger(raw, name, max = 100000) {
+            if (!/^\d+$/.test(String(raw))) throw new Error(`${name} must be a positive integer.`);
+            const n = Number(raw);
+            if (!Number.isSafeInteger(n) || n < 1 || n > max) throw new Error(`${name} must be in 1..${max}.`);
+            return n;
+          }
+          
+          const fs = require('fs');
+          const path = require('path');
+          const os = require('os');
+          const crypto = require('crypto');
+          const { spawn } = require('child_process');
+          
+          const bucket = process.env.R2_BUCKET_NAME || '';
+          const prefix = process.env.BACKUP_PREFIX || 'database_backups';
+          const backupFormat = process.env.BACKUP_FORMAT || 'supabase-cli-r2-v1';
+          const retentionDays = positiveInteger(process.env.RETENTION_DAYS || '30', 'RETENTION_DAYS', 36500);
+          const minKeep = positiveInteger(process.env.MIN_BACKUPS_PER_SCHOOL || '3', 'MIN_BACKUPS_PER_SCHOOL');
+          const retentionEnabled = process.env.RETENTION_ENABLED === 'true';
+          if (!bucket) throw new Error('Missing R2_BUCKET_NAME');
+          if (!/^[a-z0-9][a-z0-9.-]*$/.test(bucket) || !prefix.split('/').every(x=>/^[A-Za-z0-9_-]+$/.test(x))) throw new Error('Unsafe R2 bucket/prefix.');
+          
+          
+          function run(command, args) {
+            return new Promise((resolve, reject) => {
+              const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+              let stdout = '', stderr = '';
+              child.stdout.on('data', d => { stdout += d.toString(); });
+              child.stderr.on('data', d => { stderr += d.toString(); });
+              child.on('error', reject);
+              child.on('close', code => {
+                if (code === 0) resolve({ stdout, stderr });
+                else {
+                  const e = new Error(`${command} exit ${code}: ${stderr.slice(-4000)}`);
+                  e.stderr = stderr; e.code = code;
+                  reject(e);
+                }
+              });
+            });
+          }
+          
+          function sha256File(file) {
+            const h = crypto.createHash('sha256');
+            const fd = fs.openSync(file, 'r');
+            const buf = Buffer.allocUnsafe(1024 * 1024);
+            try {
+              let n;
+              while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
+            } finally {
+              fs.closeSync(fd);
+            }
+            return h.digest('hex');
+          }
+          
+          async function uploadOne(item) {
+            let tempDir;
+            try {
+              if (!/^[A-Za-z0-9_-]+$/.test(String(item.slug || ''))) throw new Error('Invalid upload slug.');
+              const name = path.basename(item.bundle);
+              if (!snapshotInfoForBundle(name, item.slug)) throw new Error('Unrecognized backup filename.');
+              const manifest = JSON.parse(fs.readFileSync(item.manifest, 'utf8'));
+              if (manifest.source_slug !== item.slug || manifest.format !== backupFormat || manifest.format_version !== 1) throw new Error('Local manifest identity/format mismatch.');
+              const expectedHash = sha256File(item.bundle);
+              const shaText = fs.readFileSync(item.shaFile, 'utf8').trim();
+              if (expectedHash !== item.bundleSha || shaText !== `${expectedHash}  ${name}`) throw new Error('Local bundle/checksum/report mismatch.');
+              const remoteDir = `r2:${bucket}/${prefix}/${item.slug}`;
+              const files = await listRemoteFiles(remoteDir);
+              const existing = new Set(files.map(f => f.Path));
+              tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'backup-r2-'));
+              const flags = ['--s3-no-check-bucket','--retries','5','--low-level-retries','10','--contimeout','30s','--timeout','10m'];
+              console.log(`Uploading [${item.slug}] ${name}; exact_existing_candidates=${[name, name+'.sha256', name+'.manifest.json'].filter(n => existing.has(n)).length}`);
+              // The manifest is published LAST, after archive + checksum round-trip checks.
+              // Matching pre-existing artifacts are verified/reused; conflicting bytes are NEVER overwritten.
+              // --immutable is a client-side safeguard, NOT an atomic distributed lock.
+              for (const [local, remoteName] of [[item.bundle,name],[item.shaFile,name+'.sha256'],[item.manifest,name+'.manifest.json']]) {
+                const remote = `${remoteDir}/${remoteName}`;
+                const tmp = path.join(tempDir, remoteName);
+                if (!existing.has(remoteName)) await run('rclone', ['copyto',local,remote,...flags,'--immutable','--checksum']);
+                await run('rclone',['copyto',remote,tmp,...flags]);
+                if (fs.statSync(local).size !== fs.statSync(tmp).size || sha256File(local) !== sha256File(tmp)) {
+                  throw new Error(`R2 content conflict/verification failure: ${remoteName}. Remote artifacts were NOT deleted.`);
+                }
+                fs.rmSync(tmp, { force:true });
+                if (existing.has(remoteName)) console.log(`Verified and reused exact existing artifact: ${remoteName}`);
+              }
+              console.log(`VERIFIED R2 COMPLETE SET [${item.slug}] ${name}`);
+              return true;
+            } catch (e) {
+              // A successful/ambiguous copy does not prove exclusive ownership. Never delete
+              // remote artifacts during failure handling. Old partial sets use age-gated cleanup.
+              console.error(`UPLOAD FAILURE DETAIL [${item.slug}]: ${String(e.message || e).slice(0,6000)}`);
+              return false;
+            } finally {
+              if (tempDir) fs.rmSync(tempDir, { recursive:true, force:true });
+            }
+          }
+          
+          async function listRemoteFiles(remoteDir) {
+            // Fail closed on 403, NoSuchBucket, DNS/CLI errors, malformed JSON, etc.
+            // A missing prefix on S3/R2 is an empty successful listing, not a missing bucket.
+            const { stdout } = await run('rclone', ['lsjson', remoteDir, '--files-only', '--s3-no-check-bucket', '--retries', '5', '--low-level-retries', '10', '--contimeout', '30s', '--timeout', '2m']);
+            const files = JSON.parse(stdout);
+            if (!Array.isArray(files) || files.some(f => !f || typeof f.Path !== 'string' || f.IsDir === true || f.Path.includes('/'))) throw new Error('Invalid R2 directory listing.');
+            return files;
+          }
+          
+          function validVietnamStampToEpoch(stamp) {
+            // Accept both v12 millisecond stamps and v11 second-only stamps.
+            const m = String(stamp || '').match(/^(\d{2})-(\d{2})-(\d{2})(?:-(\d{3}))?_(\d{2})-(\d{2})-(\d{4})$/);
+            if (!m) return null;
+            const hh = Number(m[1]), mm = Number(m[2]), ss = Number(m[3]);
+            const millis = m[4] ? Number(m[4]) : 0;
+            const dd = Number(m[5]), mo = Number(m[6]), yyyy = Number(m[7]);
+            if (hh > 23 || mm > 59 || ss > 59 || millis > 999 || mo < 1 || mo > 12 || dd < 1 || dd > 31) return null;
+            // Vietnam has a fixed UTC+7 civil offset and no DST. Convert local filename time to UTC epoch.
+            const epochMs = Date.UTC(yyyy, mo - 1, dd, hh - 7, mm, ss, millis);
+            const check = new Date(epochMs + 7 * 3600 * 1000);
+            if (check.getUTCFullYear() !== yyyy || check.getUTCMonth() + 1 !== mo || check.getUTCDate() !== dd ||
+                check.getUTCHours() !== hh || check.getUTCMinutes() !== mm || check.getUTCSeconds() !== ss ||
+                check.getUTCMilliseconds() !== millis) return null;
+            return epochMs;
+          }
+          
+          function snapshotInfoForBundle(base, slug) {
+            const escSlug = slug.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          
+            // v12 collision-safe family:
+            // <slug>_<HH-MM-SS-mmm>_<DD-MM-YYYY>_<run-token>.tar.gz
+            let m = String(base || '').match(new RegExp(`^${escSlug}_(\\d{2}-\\d{2}-\\d{2}-\\d{3}_\\d{2}-\\d{2}-\\d{4})_([A-Za-z0-9-]+)\\.tar\\.gz$`));
+            if (m) {
+              const epochMs = validVietnamStampToEpoch(m[1]);
+              if (epochMs !== null) return { epochMs, naming: 'unique-v12', stamp: m[1], runToken: m[2] };
+            }
+          
+            // Backward compatibility with v11 second-only names:
+            // <slug>_<HH-MM-SS>_<DD-MM-YYYY>.tar.gz
+            m = String(base || '').match(new RegExp(`^${escSlug}_(\\d{2}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{4})\\.tar\\.gz$`));
+            if (m) {
+              const epochMs = validVietnamStampToEpoch(m[1]);
+              if (epochMs !== null) return { epochMs, naming: 'short-vn-v11', stamp: m[1] };
+            }
+          
+            // Backward compatibility with backups created by v7 and earlier:
+            // <slug>_<YYYYMMDDTHHMMSSZ>_<format>.tar.gz
+            const escFormat = backupFormat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            m = String(base || '').match(new RegExp(`^${escSlug}_(\\d{8})T(\\d{2})(\\d{2})(\\d{2})Z_${escFormat}\\.tar\\.gz$`));
+            if (m) {
+              const y = Number(m[1].slice(0, 4)), mo = Number(m[1].slice(4, 6)), d = Number(m[1].slice(6, 8));
+              const hh = Number(m[2]), mm = Number(m[3]), ss = Number(m[4]);
+              const epochMs = Date.UTC(y, mo - 1, d, hh, mm, ss);
+              const check = new Date(epochMs);
+              if (check.getUTCFullYear() === y && check.getUTCMonth() + 1 === mo && check.getUTCDate() === d &&
+                  check.getUTCHours() === hh && check.getUTCMinutes() === mm && check.getUTCSeconds() === ss) {
+                return { epochMs, naming: 'legacy-v7', stamp: `${m[1]}T${m[2]}${m[3]}${m[4]}Z` };
+              }
+            }
+            return null;
+          }
+          
+          function managedArtifactInfo(fileName, slug) {
+            let base = '';
+            let kind = '';
+            if (fileName.endsWith('.tar.gz.manifest.json')) {
+              base = fileName.slice(0, -'.manifest.json'.length);
+              kind = 'manifest';
+            } else if (fileName.endsWith('.tar.gz.sha256')) {
+              base = fileName.slice(0, -'.sha256'.length);
+              kind = 'sha256';
+            } else if (fileName.endsWith('.tar.gz')) {
+              base = fileName;
+              kind = 'bundle';
+            } else {
+              return null;
+            }
+          
+            // Only touch exact backup artifacts from v12, v11, or the legacy v7 family.
+            // Unrelated archives are ignored.
+            const snapshot = snapshotInfoForBundle(base, slug);
+            if (!snapshot) return null;
+            return { base, kind, ...snapshot };
+          }
+          
+          async function cleanupCompleteRetention(slug) {
+            const remoteDir = `r2:${bucket}/${prefix}/${slug}`;
+            const files = await listRemoteFiles(remoteDir);
+            const byName = new Map(files.map(f => [f.Path, f]));
+            const bundles = files
+              .map(f => ({ file: f, info: managedArtifactInfo(String(f.Path || ''), slug) }))
+              .filter(x => x.info?.kind === 'bundle')
+              .filter(x => byName.has(`${x.file.Path}.sha256`) && byName.has(`${x.file.Path}.manifest.json`))
+              // Sort by parsed snapshot time, not lexical filename order. v12 includes milliseconds;
+              // v11/v7 remain fully backward compatible.
+              .sort((a, b) => b.info.epochMs - a.info.epochMs || String(b.file.Path).localeCompare(String(a.file.Path)))
+              .map(x => x.file);
+            const cutoff = Date.now() - retentionDays * 86400 * 1000;
+            const keep = new Set(bundles.slice(0, minKeep).map(f => f.Path));
+            for (const b of bundles) {
+              if (keep.has(b.Path)) continue;
+              // Delete only when ALL THREE members of the complete set are older than retention.
+              const parts = [b, byName.get(`${b.Path}.sha256`), byName.get(`${b.Path}.manifest.json`)];
+              const times = parts.map(f => new Date(f?.ModTime).getTime());
+              if (times.some(t => !Number.isFinite(t))) {
+                console.warn(`Retention skipped ${b.Path}: invalid ModTime on one or more artifacts.`);
+                continue;
+              }
+              if (Math.max(...times) >= cutoff) continue;
+              for (const suffix of ['.manifest.json', '.sha256', '']) {
+                const remote = `${remoteDir}/${b.Path}${suffix}`;
+                try {
+                  if (!retentionEnabled) { console.log(`RETENTION DRY RUN: ${remote}`); continue; }
+                  await run('rclone', ['deletefile', remote, '--s3-no-check-bucket']);
+                  console.log(`Retention deleted complete-set artifact: ${remote}`);
+                } catch (e) {
+                  console.warn(`Retention warning for ${remote}: ${String(e.message || e).slice(0, 1000)}`);
+                  break; // Do not remove the bundle if deletion of its manifest failed.
+                }
+              }
+            }
+          }
+          
+          async function cleanupOrphansInDir(remoteDir, slug, label, days = retentionDays) {
+            const files = await listRemoteFiles(remoteDir);
+            const groups = new Map();
+            for (const file of files) {
+              const info = managedArtifactInfo(String(file.Path || ''), slug);
+              if (!info) continue;
+              if (!groups.has(info.base)) groups.set(info.base, new Map());
+              groups.get(info.base).set(info.kind, file);
+            }
+          
+            const cutoff = Date.now() - days * 86400 * 1000;
+            let orphanSets = 0;
+            let deletedFiles = 0;
+            for (const [base, parts] of groups) {
+              const complete = parts.has('bundle') && parts.has('sha256') && parts.has('manifest');
+              if (complete) continue;
+          
+              // Conservative orphan rule: use the NEWEST timestamp among the surviving pieces.
+              // The set is deleted only when every existing piece is older than the
+              // retention window, so an upload currently in progress can never qualify.
+              const times = [...parts.values()].map(f => new Date(f.ModTime).getTime());
+              if (!times.length || times.some(t => !Number.isFinite(t))) {
+                console.warn(`Orphan cleanup skipped [${label}] ${base}: at least one invalid ModTime.`);
+                continue;
+              }
+              const newest = Math.max(...times);
+              if (newest >= cutoff) continue;
+          
+              orphanSets++;
+              const orderedKinds = ['manifest', 'sha256', 'bundle'];
+              for (const kind of orderedKinds) {
+                const file = parts.get(kind);
+                if (!file) continue;
+                const remote = `${remoteDir}/${file.Path}`;
+                try {
+                  if (!retentionEnabled) { console.log(`RETENTION DRY RUN: ${remote}`); continue; }
+                  await run('rclone', ['deletefile', remote, '--s3-no-check-bucket']);
+                  deletedFiles++;
+                  console.log(`Orphan cleanup deleted [${label}]: ${remote}`);
+                } catch (e) {
+                  console.warn(`Orphan cleanup warning [${label}] for ${remote}: ${String(e.message || e).slice(0, 1000)}`);
+                  break;
+                }
+              }
+            }
+            if (orphanSets || deletedFiles) {
+              console.log(`Orphan cleanup summary [${label}] [${slug}]: sets=${orphanSets}, files_deleted=${deletedFiles}`);
+            }
+          }
+          
+          async function main() {
+            const report = JSON.parse(fs.readFileSync('backup_results.json', 'utf8'));
+            let uploadOk = 0, uploadFail = 0;
+            const successfulSlugs = new Set();
+            for (const item of report.results || []) {
+              if (item.uploadVerified === true || await uploadOne(item)) {
+                uploadOk++;
+                successfulSlugs.add(item.slug);
+              } else uploadFail++;
+            }
+            // Preserve the existing complete-backup retention policy exactly:
+            // only a slug with a newly verified upload is allowed to age out old
+            // COMPLETE sets. This prevents a failed backup run from reducing recovery depth.
+            for (const slug of successfulSlugs) {
+              try { await cleanupCompleteRetention(slug); }
+              catch (e) { console.warn(`Complete-set cleanup warning [${slug}]: ${String(e.message || e).slice(0, 3000)}`); }
+            }
+          
+            // Orphan files in the main backup directory are not valid restore points, so
+            // they may be cleaned even when today's backup for that slug failed. Limit
+            // this to slugs present in the current D1-driven report, require age >
+            // RETENTION_DAYS, and only touch this workflow's exact backup naming family.
+            const knownSlugs = new Set([
+              ...(report.results || []).map(x => String(x.slug || '')),
+              ...(report.failures || []).map(x => String(x.slug || ''))
+            ].filter(x => /^[A-Za-z0-9_-]+$/.test(x)));
+          
+            for (const slug of knownSlugs) {
+              try {
+                await cleanupOrphansInDir(`r2:${bucket}/${prefix}/${slug}`, slug, 'main');
+              } catch (e) {
+                console.warn(`Orphan cleanup warning [main] [${slug}]: ${String(e.message || e).slice(0, 3000)}`);
+              }
+            }
+          
+            console.log(`R2 summary: uploaded_verified=${uploadOk}, upload_failed=${uploadFail}, backup_generation_failed=${(report.failures || []).length}`);
+            if (uploadFail > 0 || (report.failures || []).length > 0) process.exit(1);
+          }
+          
+          module.exports = { uploadOne };
+          if (require.main === module) main().catch(e => {
+            console.error(`R2 FATAL: ${String(e.message || e).slice(0, 6000)}`);
+            process.exit(1);
+          });
+          NODE
+          cat > backup_cli.js <<'NODE'
+          process.umask(0o077);
+          
+          function parseQualifiedName(raw) {
+            const token = '("(?:[^"\\r\\n]|"")+"|[A-Za-z_\\u0080-\\uffff][A-Za-z0-9_$\\u0080-\\uffff]*)';
+            const m = String(raw).trim().match(new RegExp(`^${token}\\s*\\.\\s*${token}$`));
+            if (!m) throw new Error(`Unsupported qualified SQL identifier: ${raw}`);
+            const parts = [m[1], m[2]].map(s => s.startsWith('"') ? s.slice(1, -1).replace(/""/g, '"') : s.toLowerCase());
+            // The v1 manifest uses schema.table keys. Embedded dots cannot be represented
+            // unambiguously. Reject instead of silently restoring/counting the wrong relation.
+            if (parts.some(s => !s || /[.\x00-\x1f\x7f]/.test(s))) throw new Error(`Identifier cannot be represented safely in backup format v1: ${raw}`);
+            return parts;
+          }
+          
+          function splitSqlIdentifierList(text) {
+            const out = []; let cur = '', quoted = false;
+            for (let i = 0; i < text.length; i++) {
+              const ch = text[i];
+              if (ch === '"') {
+                cur += ch;
+                if (quoted && text[i + 1] === '"') { cur += '"'; i++; continue; }
+                quoted = !quoted; continue;
+              }
+              if (ch === ',' && !quoted) { out.push(cur.trim()); cur = ''; continue; }
+              cur += ch;
+            }
+            if (cur.trim()) out.push(cur.trim());
+            if (quoted) throw new Error('Unterminated quoted column identifier.');
+            return out;
+          }
+          
+          function unquoteIdentifier(raw) {
+            const v = String(raw).trim();
+            if (/^"(?:[^"]|"")+"$/.test(v)) return v.slice(1, -1).replace(/""/g, '"');
+            if (!/^[A-Za-z_\u0080-\uffff][A-Za-z0-9_$\u0080-\uffff]*$/.test(v)) throw new Error(`Unsupported column identifier: ${v}`);
+            return v.toLowerCase();
+          }
+          
+          function parseCopyHeader(line) {
+            const withColumns = line.match(/^COPY\s+(.+?)\s+\((.*)\)\s+FROM stdin;$/);
+            const bare = withColumns ? null : line.match(/^COPY\s+(.+?)\s+FROM stdin;$/);
+            const m = withColumns || bare;
+            if (!m) return null;
+            const [schema, table] = parseQualifiedName(m[1]);
+            const columns = withColumns ? splitSqlIdentifierList(m[2]).map(unquoteIdentifier) : null;
+            if (columns && new Set(columns).size !== columns.length) throw new Error(`Duplicate COPY column in ${schema}.${table}`);
+            return { key: `${schema}.${table}`, columns };
+          }
+          
+          async function* dumpLines(file) {
+            // Native stream async iteration propagates read errors (unlike relying only on
+            // readline's input stream). Memory is bounded by chunk size + longest dump row.
+            let pending = '';
+            for await (const chunk of fs.createReadStream(file, { encoding: 'utf8', highWaterMark: 1024 * 1024 })) {
+              pending += chunk;
+              let start = 0, pos;
+              while ((pos = pending.indexOf('\n', start)) >= 0) {
+                const line = pending.slice(start, pos);
+                yield line.endsWith('\r') ? line.slice(0, -1) : line;
+                start = pos + 1;
+              }
+              pending = pending.slice(start);
+            }
+            if (pending) yield pending.endsWith('\r') ? pending.slice(0, -1) : pending;
+          }
+          
+          async function scanCopyFile(file, outputFile = null) {
+            const counts = Object.create(null), layouts = new Map(), sequences = new Map();
+            const seen = new Set(); let current = null, count = 0, removed = 0;
+            const output = outputFile ? fs.createWriteStream(outputFile, { encoding: 'utf8', flags: 'w', mode: 0o600 }) : null;
+            const finished = output ? require('stream/promises').finished(output) : null;
+            if (finished) finished.catch(() => {});
+            try {
+              for await (const line of dumpLines(file)) {
+                let outLine = line;
+                if (current !== null) {
+                  if (line === '\\.') { counts[current] = count; current = null; count = 0; }
+                  else {
+                    count++;
+                    if (!Number.isSafeInteger(count)) throw new Error('COPY row count exceeds safe integer range.');
+                  }
+                } else {
+                  const header = parseCopyHeader(line);
+                  if (header) {
+                    if (seen.has(header.key)) throw new Error(`Duplicate COPY block: ${header.key}`);
+                    seen.add(header.key); current = header.key; count = 0;
+                    if (header.columns === null) throw new Error(`COPY without an explicit column list is unsupported: ${header.key}`);
+                    layouts.set(header.key, header.columns);
+                  } else if (/^\s*SELECT\s+pg_catalog\.setval\s*\(/i.test(line)) {
+                    const m = line.match(/^\s*SELECT\s+pg_catalog\.setval\('((?:[^']|'')+)',\s*(-?\d+),\s*(true|false)\);\s*$/i);
+                    if (!m) throw new Error('Unsupported pg_dump setval statement; refusing to rewrite it.');
+                    const qualified = m[1].replace(/''/g, "'");
+                    const key = parseQualifiedName(qualified).join('.');
+                    const last = BigInt(m[2]);
+                    if (last < -(1n << 63n) || last > (1n << 63n) - 1n) throw new Error(`Out-of-range sequence state: ${key}`);
+                    if (sequences.has(key)) throw new Error(`Duplicate sequence state: ${key}`);
+                    sequences.set(key, { key, last: last.toString(), called: m[3].toLowerCase() === 'true' });
+                    if (output) { removed++; outLine = '-- Source setval omitted; guarded sequence repair runs before COMMIT.'; }
+                  }
+                }
+                if (output && !output.write(outLine + '\n')) await require('events').once(output, 'drain');
+              }
+              if (current !== null) throw new Error(`Dump ended inside COPY block: ${current}`);
+              if (output) { output.end(); await finished; }
+              return { counts: Object.fromEntries(Object.entries(counts).sort(([a],[b]) => a.localeCompare(b))), layouts, sequences, removed };
+            } catch (e) {
+              if (output) { output.destroy(); fs.rmSync(outputFile, { force: true }); }
+              throw e;
+            }
+          }
+          
+          async function parseCopyCounts(file) { return (await scanCopyFile(file)).counts; }
+          async function parseCopyLayouts(file) { return (await scanCopyFile(file)).layouts; }
+          async function parseCopyTableNames(file) { return [...(await parseCopyLayouts(file)).keys()].sort(); }
+          async function makeInPlaceDataFile(inputFile, outputFile) { return (await scanCopyFile(inputFile, outputFile)).removed; }
+          
+          function dumpSemanticFingerprint(file) {
+            // Remove ONLY matching pg_dump guard commands at file boundaries. Never remove
+            // guard-looking lines inside function bodies, string literals, or COPY payloads.
+            const lines = fs.readFileSync(file, 'utf8').split('\n');
+            const ignorable = s => /^\s*(?:--.*)?$/.test(s);
+            let first = 0, last = lines.length - 1;
+            while (first < lines.length && ignorable(lines[first])) first++;
+            while (last >= 0 && ignorable(lines[last])) last--;
+            const m = (lines[first] || '').match(/^\\restrict ([A-Za-z0-9]+)\r?$/);
+            if (m && lines[last] && lines[last].replace(/\r$/, '') === `\\unrestrict ${m[1]}` && first < last) {
+              lines.splice(last, 1); lines.splice(first, 1);
+            }
+            return crypto.createHash('sha256').update(lines.join('\n'), 'utf8').digest('hex');
+          }
+          
+          function safeError(err) {
+            const text = String(err && (err.stderr || err.message || err) || 'Unknown error');
+            return text.replace(/postgres(?:ql)?:\/\/[^\s"']+/gi, '[DATABASE_URL_REDACTED]')
+              .split(/\r?\n/).map(line => {
+                if (/^\s*(?:DETAIL|CONTEXT|STATEMENT|QUERY):/i.test(line)) return '[ROW/SQL CONTEXT REDACTED]';
+                return line.replace(/(invalid input syntax[^:]*:)\s*.*/i, '$1 [VALUE REDACTED]');
+              }).join('\n').slice(-16000);
+          }
+          
+          function positiveInteger(raw, name, max = 100000) {
+            if (!/^\d+$/.test(String(raw))) throw new Error(`${name} must be a positive integer.`);
+            const n = Number(raw);
+            if (!Number.isSafeInteger(n) || n < 1 || n > max) throw new Error(`${name} must be in 1..${max}.`);
+            return n;
+          }
+          
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+          const { spawn } = require('child_process');
+          
+          const cfAccountId = process.env.CF_ACCOUNT_ID || '';
+          const cfApiToken = process.env.CF_API_TOKEN || '';
+          const cfDbId = process.env.CF_D1_DB_ID || '';
+          const inputSlug = (process.env.INPUT_SLUG || '').trim();
+          const backupFormat = process.env.BACKUP_FORMAT || 'supabase-cli-r2-v1';
+          const restoreGuardSchema = '_supabase_backup_restore_internal';
+          const restoreGuardComment = 'Internal commit marker for automated Supabase backup/restore workflow';
+          const filenameFamily = 'vn-ms-run-v2';
+          
+          function numericEnv(name) {
+            const v = String(process.env[name] || '').trim();
+            return /^\d+$/.test(v) ? v : '';
+          }
+          
+          // A filename must be unique even when another repository targets the same R2 bucket/slug.
+          // GitHub concurrency only serializes runs inside this repository, so timestamp-only names are
+          // insufficient. Repository ID + run ID + run attempt is stable, traceable and collision-safe.
+          const githubRepositoryId = numericEnv('GITHUB_REPOSITORY_ID');
+          const githubRunId = numericEnv('GITHUB_RUN_ID');
+          const githubRunAttempt = numericEnv('GITHUB_RUN_ATTEMPT') || '1';
+          const backupRunToken = githubRepositoryId && githubRunId
+            ? `gh${githubRepositoryId}-${githubRunId}-a${githubRunAttempt}`
+            : `local-${process.pid}-${crypto.randomBytes(8).toString('hex')}`;
+          
+          if (!cfAccountId || !cfApiToken || !cfDbId) {
+            console.error('ERROR: Missing Cloudflare D1 secrets.');
+            process.exit(1);
+          }
+          if (inputSlug && !/^[A-Za-z0-9_-]+$/.test(inputSlug)) {
+            console.error('ERROR: truong_slug contains unsupported characters.');
+            process.exit(1);
+          }
+          console.log(`BACKUP NAMING: family=${filenameFamily}; run_token=${backupRunToken}`);
+          
+          const managedSchemas = new Set([
+            'auth', 'storage', 'realtime', 'graphql', 'graphql_public',
+            'extensions', 'pgbouncer', 'pgsodium', 'pgsodium_masks',
+            'vault', 'cron', 'supabase_functions', 'supabase_migrations',
+            'net', '_realtime', '_analytics', restoreGuardSchema
+          ]);
+          
+          
+          
+          function run(command, args, options = {}) {
+            return new Promise((resolve, reject) => {
+              const launchArgs = command === 'psql' ? ['--set','VERBOSITY=terse','--set','SHOW_CONTEXT=never',...args] : args;
+              const child = spawn(command, launchArgs, {
+                cwd: options.cwd,
+                env: options.env || process.env,
+                stdio: ['ignore', 'pipe', 'pipe']
+              });
+              let stdout = '';
+              let stderr = '';
+              child.stdout.on('data', d => {
+                const s = d.toString();
+                stdout += s;
+                if (options.echoStdout) process.stdout.write(s);
+                if (stdout.length > 8 * 1024 * 1024) stdout = stdout.slice(-8 * 1024 * 1024);
+              });
+              child.stderr.on('data', d => {
+                const s = d.toString();
+                stderr += s;
+                if (stderr.length > 8 * 1024 * 1024) stderr = stderr.slice(-8 * 1024 * 1024);
+              });
+              child.on('error', reject);
+              child.on('close', (code, signal) => {
+                if (stderr && options.echoStderr !== false) console.error(safeError({ stderr }));
+                if (code === 0) return resolve({ stdout, stderr });
+                const e = new Error(`${command} exited with code ${code}`);
+                e.code = code; e.signal = signal;
+                e.stdout = stdout;
+                e.stderr = stderr;
+                reject(e);
+              });
+            });
+          }
+          
+          async function d1Query(sql, params = []) {
+            const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId}/d1/database/${cfDbId}/query`;
+            const resp = await fetch(url, {
+              method: 'POST',
+              signal: AbortSignal.timeout(30000),
+              headers: {
+                Authorization: `Bearer ${cfApiToken}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({ sql, params })
+            });
+            const body = await resp.json().catch(() => ({}));
+            if (!resp.ok || body.success === false) {
+              throw new Error(`D1 query failed: HTTP ${resp.status}; ${JSON.stringify(body.errors || body)}`);
+            }
+            const block = body.result?.[0];
+            if (!block || block.success === false) {
+              throw new Error(`D1 query result failed: ${JSON.stringify(block || body)}`);
+            }
+            return block.results || [];
+          }
+          
+          function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+          
+          let maintenanceRouteLogged = false;
+          
+          function maintenanceDbUrl(dbUrl) {
+            const u = new URL(dbUrl);
+            if (!['postgres:', 'postgresql:'].includes(u.protocol)) throw new Error('Invalid PostgreSQL URL protocol.');
+          
+            // Supabase shared pooler: 6543 = transaction mode, 5432 = session mode.
+            // Long-running dump/maintenance work uses session mode to avoid transaction-pooler limits.
+            if (u.hostname.endsWith('.pooler.supabase.com') && u.port === '6543') {
+              u.port = '5432';
+              if (!maintenanceRouteLogged) {
+                console.log('MAINTENANCE CONNECTION: detected Supabase shared transaction pooler :6543; using session pooler :5432 for backup/dump traffic.');
+                maintenanceRouteLogged = true;
+              }
+            }
+            if (!u.searchParams.has('sslmode')) u.searchParams.set('sslmode', 'require');
+            if (!u.searchParams.has('connect_timeout')) u.searchParams.set('connect_timeout', '30');
+            if (!u.searchParams.has('keepalives')) u.searchParams.set('keepalives', '1');
+            if (!u.searchParams.has('keepalives_idle')) u.searchParams.set('keepalives_idle', '30');
+            if (!u.searchParams.has('keepalives_interval')) u.searchParams.set('keepalives_interval', '10');
+            if (!u.searchParams.has('keepalives_count')) u.searchParams.set('keepalives_count', '5');
+            return u.toString();
+          }
+          
+          function isTransientPgConnectionError(text) {
+            return /(SSL error:\s*unexpected eof|server closed the connection unexpectedly|connection reset by peer|broken pipe|connection timed out|timeout expired|could not receive data from server|could not send data to server|terminating connection due to administrator command|the database system is starting up|cannot connect now|network is unreachable|no route to host|temporary failure in name resolution|i\/o timeout|TLS handshake timeout)/i.test(String(text || ''));
+          }
+          
+          const pgServiceFiles = new Map();
+          let pgServiceDirectory;
+          function pgEnvFromUrl(dbUrl) {
+            const u = new URL(maintenanceDbUrl(dbUrl));
+            const cfg = {
+              host:u.hostname,port:u.port || '5432',user:decodeURIComponent(u.username),
+              dbname:decodeURIComponent(u.pathname.replace(/^\//,'')) || 'postgres',
+              sslmode:u.searchParams.get('sslmode') || 'require',connect_timeout:'30',
+              keepalives:'1',keepalives_idle:'30',keepalives_interval:'10',keepalives_count:'5'
+            };
+            if (Object.values(cfg).some(v=>/[\r\n\x00]/.test(v))) throw new Error('Invalid newline/NUL in libpq connection settings.');
+            const id = crypto.createHash('sha256').update(JSON.stringify(cfg)).digest('hex');
+            if (!pgServiceFiles.has(id)) {
+              if (!pgServiceDirectory) {
+                pgServiceDirectory=fs.mkdtempSync(path.join(require('os').tmpdir(),'supabase-pg-service-'));
+                process.once('exit',()=>fs.rmSync(pgServiceDirectory,{recursive:true,force:true}));
+              }
+              const file=path.join(pgServiceDirectory,id+'.conf');
+              fs.writeFileSync(file,'[maintenance]\n'+Object.entries(cfg).map(([k,v])=>`${k}=${v}`).join('\n')+'\n',{mode:0o600});
+              pgServiceFiles.set(id,file);
+            }
+            const env={...process.env};
+            for(const key of Object.keys(env)) if(key.startsWith('PG')) delete env[key];
+            return {...env,PGSERVICEFILE:pgServiceFiles.get(id),PGSERVICE:'maintenance',
+              PGPASSWORD:decodeURIComponent(u.password),PGAPPNAME:'supabase-audit-maintenance',PGCLIENTENCODING:'UTF8'};
+          }
+          
+          
+          async function psql(dbUrl, sql, fieldSep = '\t') {
+            let lastErr;
+            for (let attempt = 1; attempt <= 4; attempt++) {
+              try {
+                const { stdout } = await run('psql', [
+                  '-X', '-v', 'ON_ERROR_STOP=1', '-A', '-t', '-F', fieldSep, '-c', sql
+                ], { env: pgEnvFromUrl(dbUrl), echoStderr: false });
+                return stdout.trim();
+              } catch (err) {
+                lastErr = err;
+                const msg = safeError(err);
+                if (!isTransientPgConnectionError(msg) || attempt === 4) throw err;
+                const wait = [2, 5, 10][attempt - 1] || 10;
+                console.warn(`Transient PostgreSQL connection error during backup query (attempt ${attempt}/4). Retrying in ${wait}s: ${msg.split('\n')[0]}`);
+                await sleep(wait * 1000);
+              }
+            }
+            throw lastErr;
+          }
+          
+          async function dumpWithRetry(dbUrl, outputFile, extraArgs, label) {
+            const maintenanceUrl = maintenanceDbUrl(dbUrl);
+            let lastErr;
+            for (let attempt = 1; attempt <= 4; attempt++) {
+              fs.rmSync(outputFile, { force: true });
+              try {
+                const result = await run('supabase', ['db', 'dump', '--db-url', maintenanceUrl, '-f', outputFile, ...extraArgs], { echoStdout: true, echoStderr: false });
+                if (result.stderr && result.stderr.trim()) console.warn(`${label} diagnostic: ${safeError({ stderr: result.stderr })}`);
+                if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size === 0) throw new Error(`${label} produced an empty dump file.`);
+                return;
+              } catch (err) {
+                lastErr = err;
+                fs.rmSync(outputFile, { force: true });
+                const msg = safeError(err);
+                if (!isTransientPgConnectionError(msg) || attempt === 4) throw err;
+                const wait = [5, 10, 20][attempt - 1] || 20;
+                console.warn(`Transient connection error during ${label} (attempt ${attempt}/4). Retrying in ${wait}s.`);
+                await sleep(wait * 1000);
+              }
+            }
+            throw lastErr;
+          }
+          
+          function sqlLiteral(value) { return "'" + String(value).replace(/'/g, "''") + "'"; }
+          
+          async function cleanupOwnedRestoreGuard(dbUrl) {
+            const state = await psql(dbUrl,`SELECT CASE WHEN to_regnamespace(${sqlLiteral(restoreGuardSchema)}) IS NULL THEN 'absent' ELSE 'present' END;`);
+            if (state !== 'absent') throw new Error('UNRESOLVED_RESTORE_MARKER: reserved restore schema exists. Review the previous restore before backup. This workflow will not DROP it automatically.');
+          }
+          
+          
+          async function relationExists(dbUrl, regclass) {
+            const escaped = quoteQualified(regclass).replace(/'/g, "''");
+            return (await psql(dbUrl, `SELECT CASE WHEN to_regclass('${escaped}') IS NULL THEN '0' ELSE '1' END;`)) === '1';
+          }
+          
+          async function safeCount(dbUrl, qualified) {
+            if (!(await relationExists(dbUrl, qualified))) return 0;
+            const parts = qualified.split('.');
+            const q = parts.map(x => '"' + x.replace(/"/g, '""') + '"').join('.');
+            const out = await psql(dbUrl, `SELECT count(*)::bigint FROM ${q};`);
+            return Number(out || 0);
+          }
+          
+          function sha256File(file) {
+            const h = crypto.createHash('sha256');
+            const fd = fs.openSync(file, 'r');
+            const buf = Buffer.allocUnsafe(1024 * 1024);
+            try {
+              let n;
+              while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) h.update(buf.subarray(0, n));
+            } finally {
+              fs.closeSync(fd);
+            }
+            return h.digest('hex');
+          }
+          
+          
+          
+          function quoteQualified(key) {
+            const i = key.indexOf('.');
+            if (i <= 0 || key.indexOf('.', i + 1) >= 0) throw new Error('Ambiguous qualified key: ' + key);
+            return key.split('.').map(x => '"' + x.replace(/"/g, '""') + '"').join('.');
+          }
+          
+          function schemaFingerprint(file) {
+            return dumpSemanticFingerprint(file);
+          }
+          
+          
+          
+          
+          
+          async function collectManagedSignatures(dbUrl) {
+            const triggersSql = `
+              SELECT event_object_schema || '.' || event_object_table || '|' || trigger_name || '|' || event_manipulation || '|' || action_timing || '|' || action_orientation || '|' || coalesce(action_statement,'')
+              FROM information_schema.triggers
+              WHERE event_object_schema IN ('auth','storage','realtime')
+              ORDER BY 1;`;
+            const policiesSql = `
+              SELECT schemaname || '.' || tablename || '|' || policyname || '|' || cmd || '|' || permissive || '|' || coalesce(array_to_string(roles,','),'') || '|' || coalesce(qual,'') || '|' || coalesce(with_check,'')
+              FROM pg_policies
+              WHERE schemaname IN ('auth','storage','realtime')
+              ORDER BY 1;`;
+            const tr = await psql(dbUrl, triggersSql, '\x1f');
+            const po = await psql(dbUrl, policiesSql, '\x1f');
+            return {
+              triggers: tr ? tr.split(/\r?\n/).filter(Boolean) : [],
+              policies: po ? po.split(/\r?\n/).filter(Boolean) : []
+            };
+          }
+          
+          async function collectExtensions(dbUrl) {
+            const out = await psql(dbUrl, `SELECT extname || '|' || extversion FROM pg_extension ORDER BY extname;`, '\x1f');
+            return out ? out.split(/\r?\n/).filter(Boolean).map(line => {
+              const i = line.indexOf('|');
+              return { name: line.slice(0, i), version: line.slice(i + 1) };
+            }) : [];
+          }
+          
+          async function collectRealtimeTables(dbUrl) {
+            const exists = (await psql(dbUrl, `SELECT CASE WHEN EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN '1' ELSE '0' END;`)) === '1';
+            if (!exists) return [];
+            const out = await psql(dbUrl, `SELECT schemaname || '.' || tablename FROM pg_publication_tables WHERE pubname='supabase_realtime' ORDER BY schemaname, tablename;`, '\x1f');
+            return out ? out.split(/\r?\n/).filter(Boolean) : [];
+          }
+          
+          function roleLoginNames(rolesFile) {
+            const text = fs.readFileSync(rolesFile, 'utf8');
+            const names = new Set();
+            for (const line of text.split(/\r?\n/)) {
+              const m = line.match(/^CREATE ROLE\s+"?([^";\s]+)"?.*\bLOGIN\b/i);
+              if (m) names.add(m[1]);
+              const m2 = line.match(/^ALTER ROLE\s+"?([^";\s]+)"?.*\bLOGIN\b/i);
+              if (m2) names.add(m2[1]);
+            }
+            return [...names].sort();
+          }
+          
+          function vietnamFileStamp(date = new Date()) {
+            // Millisecond precision reduces accidental same-time collisions and gives deterministic
+            // latest ordering. The run token below provides a run namespace (not an atomic storage lock).
+            // HH-MM-SS-mmm_DD-MM-YYYY, e.g. 05-08-09-137_12-09-2026.
+            const parts = new Intl.DateTimeFormat('en-GB', {
+              timeZone: 'Asia/Ho_Chi_Minh',
+              year: 'numeric', month: '2-digit', day: '2-digit',
+              hour: '2-digit', minute: '2-digit', second: '2-digit',
+              hourCycle: 'h23'
+            }).formatToParts(date);
+            const p = Object.fromEntries(parts.filter(x => x.type !== 'literal').map(x => [x.type, x.value]));
+            const ms = String(date.getUTCMilliseconds()).padStart(3, '0');
+            return `${p.hour}-${p.minute}-${p.second}-${ms}_${p.day}-${p.month}-${p.year}`;
+          }
+          
+          async function assertAppTableCoverage(dbUrl, counts) {
+            const schemas = [...managedSchemas].map(sqlLiteral).join(',');
+            const out = await psql(dbUrl, `SELECT COALESCE(json_agg(json_build_array(n.nspname,c.relname))::text,'[]')
+              FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+              WHERE c.relkind='r' AND n.nspname NOT IN (${schemas},'information_schema') AND n.nspname NOT LIKE 'pg_%'
+              AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid='pg_class'::regclass AND d.objid=c.oid AND d.deptype='e');`);
+            for (const [schema, table] of JSON.parse(out || '[]')) {
+              if (/[.\x00-\x1f]/.test(schema + table)) throw new Error('Application identifier cannot be represented in backup format v1.');
+              if (!Object.hasOwn(counts, `${schema}.${table}`)) throw new Error(`Application table omitted from data.sql: ${schema}.${table}`);
+            }
+          }
+          
+          async function backupOne(row) {
+            const slug = String(row.slug || '').trim();
+            const dbUrl = String(row.supabase_sql || '').trim();
+            if (!/^[A-Za-z0-9_-]+$/.test(slug)) throw new Error(`Invalid slug from D1: ${slug}`);
+            if (!dbUrl) throw new Error(`[${slug}] Missing supabase_sql.`);
+            await cleanupOwnedRestoreGuard(dbUrl);
+          
+            const backupStartedAt = new Date().toISOString();
+            const stamp = vietnamFileStamp();
+            const artifactToken = `${backupRunToken}-n${crypto.randomBytes(12).toString("hex")}`;
+            const base = `${slug}_${stamp}_${artifactToken}`;
+            const dir = path.join('backups_cli', slug, base);
+            fs.mkdirSync(dir, { recursive: true });
+          
+            const roles = path.join(dir, 'roles.sql');
+            const rolesAfter = path.join(dir, 'roles_after.sql');
+            const schema = path.join(dir, 'schema.sql');
+            const schemaAfter = path.join(dir, 'schema_after.sql');
+            const data = path.join(dir, 'data.sql');
+            const histSchema = path.join(dir, 'history_schema.sql');
+            const histData = path.join(dir, 'history_data.sql');
+            const histDataBefore = path.join(dir, 'history_data_before.sql');
+            const histDataAfter = path.join(dir, 'history_data_after.sql');
+            const manifestPath = path.join(dir, 'manifest.json');
+            const bundle = path.join('backups_cli', slug, `${base}.tar.gz`);
+            const sideManifest = `${bundle}.manifest.json`;
+            const shaFile = `${bundle}.sha256`;
+          
+            console.log(`\n=== BACKUP [${slug}] ===`);
+          
+            // If migration history exists, capture a pre-dump probe. Migration records are part of
+            // the logical state: a DML-only migration can change data without changing schema.sql.
+            // Publishing data from one snapshot with a newer migration-history table could cause a
+            // future `supabase db push` to skip a migration that is not actually represented in the backup.
+            const migrationHistoryExistedBefore = await relationExists(dbUrl, 'supabase_migrations.schema_migrations');
+            if (migrationHistoryExistedBefore) {
+              await dumpWithRetry(dbUrl, histDataBefore, ['--use-copy', '--data-only', '--schema', 'supabase_migrations'], `[${slug}] migration-history pre-dump stability probe`);
+            }
+          
+            await dumpWithRetry(dbUrl, roles, ['--role-only'], `[${slug}] roles dump`);
+            await dumpWithRetry(dbUrl, schema, [], `[${slug}] schema dump`);
+            await dumpWithRetry(dbUrl, data, ['--use-copy', '--data-only', '-x', 'storage.buckets_vectors', '-x', 'storage.vector_indexes'], `[${slug}] data dump`);
+          
+            for (const f of [roles, schema, data]) {
+              if (!fs.existsSync(f) || fs.statSync(f).size === 0) throw new Error(`[${slug}] Empty dump component: ${path.basename(f)}`);
+            }
+          
+            let hasMigrationHistory = false;
+            if (migrationHistoryExistedBefore) {
+              // Once the table is known to exist, preservation is a hard requirement. Silently
+              // dropping migration history would make the restore operationally inconsistent.
+              await dumpWithRetry(dbUrl, histSchema, ['--schema', 'supabase_migrations'], `[${slug}] migration schema dump`);
+              await dumpWithRetry(dbUrl, histData, ['--use-copy', '--data-only', '--schema', 'supabase_migrations'], `[${slug}] migration data dump`);
+              hasMigrationHistory = fs.existsSync(histSchema) && fs.existsSync(histData) && fs.statSync(histSchema).size > 0 && fs.statSync(histData).size > 0;
+              if (!hasMigrationHistory) throw new Error(`[${slug}] Migration history exists but could not be captured completely. Backup will NOT be published.`);
+            }
+          
+            // Final stability gates run AFTER data + migration-history capture, so no migration or
+            // role/schema change can slip into history after the core consistency check.
+            await dumpWithRetry(dbUrl, schemaAfter, [], `[${slug}] schema stability verification dump`);
+            await dumpWithRetry(dbUrl, rolesAfter, ['--role-only'], `[${slug}] role stability verification dump`);
+            const schemaBeforeFp = schemaFingerprint(schema);
+            const schemaAfterFp = schemaFingerprint(schemaAfter);
+            const rolesBeforeFp = dumpSemanticFingerprint(roles);
+            const rolesAfterFp = dumpSemanticFingerprint(rolesAfter);
+            fs.rmSync(schemaAfter, { force: true });
+            fs.rmSync(rolesAfter, { force: true });
+            if (schemaBeforeFp !== schemaAfterFp) {
+              throw new Error(`[${slug}] Schema changed while this backup was being created. Backup will NOT be published. Retry when migrations/DDL are idle.`);
+            }
+            if (rolesBeforeFp !== rolesAfterFp) {
+              throw new Error(`[${slug}] Database roles changed while this backup was being created. Backup will NOT be published. Retry when role changes are idle.`);
+            }
+          
+            const migrationHistoryExistsAfter = await relationExists(dbUrl, 'supabase_migrations.schema_migrations');
+            if (migrationHistoryExistsAfter !== migrationHistoryExistedBefore) {
+              throw new Error(`[${slug}] Migration-history table existence changed while backup was running. Backup will NOT be published.`);
+            }
+            if (migrationHistoryExistedBefore) {
+              await dumpWithRetry(dbUrl, histDataAfter, ['--use-copy', '--data-only', '--schema', 'supabase_migrations'], `[${slug}] migration-history post-dump stability probe`);
+              const histBeforeFp = dumpSemanticFingerprint(histDataBefore);
+              const histArchiveFp = dumpSemanticFingerprint(histData);
+              const histAfterFp = dumpSemanticFingerprint(histDataAfter);
+              fs.rmSync(histDataBefore, { force: true });
+              fs.rmSync(histDataAfter, { force: true });
+              if (histBeforeFp !== histArchiveFp || histArchiveFp !== histAfterFp) {
+                throw new Error(`[${slug}] Supabase migration history changed while this backup was being created. Backup will NOT be published. Retry when migrations are idle.`);
+              }
+            }
+            console.log(`[${slug}] Schema, role, and migration-history stability verification PASSED.`);
+          
+            const copyCounts = await parseCopyCounts(data);
+            await assertAppTableCoverage(dbUrl, copyCounts);
+            const managed = await collectManagedSignatures(dbUrl);
+            const extensions = await collectExtensions(dbUrl);
+            const realtimeTables = await collectRealtimeTables(dbUrl);
+            const serverVersion = await psql(dbUrl, 'SHOW server_version;');
+            const databaseSizeBytes = Number(await psql(dbUrl, 'SELECT pg_database_size(current_database())::bigint;') || 0);
+            const storageObjectsLive = await safeCount(dbUrl, 'storage.objects');
+            const storageBucketsLive = await safeCount(dbUrl, 'storage.buckets');
+            const vaultSecrets = await safeCount(dbUrl, 'vault.secrets');
+            const authUsersLive = await safeCount(dbUrl, 'auth.users');
+            const authIdentitiesLive = await safeCount(dbUrl, 'auth.identities');
+          
+            // Hard coverage gate: if these critical Supabase tables exist, data.sql must contain
+            // a COPY block for them (even when the table is empty). This prevents publishing a
+            // backup that silently omitted Auth/Storage metadata because of a dump/filter change.
+            for (const key of ['auth.users', 'auth.identities', 'storage.buckets', 'storage.objects']) {
+              if (await relationExists(dbUrl, key) && !Object.prototype.hasOwnProperty.call(copyCounts, key)) {
+                throw new Error(`[${slug}] Backup integrity failure: data.sql does not contain required COPY block for ${key}. Backup will NOT be published.`);
+              }
+            }
+          
+            // Prefer counts parsed from data.sql because they describe the exact data dump snapshot.
+            const authUsers = copyCounts['auth.users'] ?? authUsersLive;
+            const authIdentities = copyCounts['auth.identities'] ?? authIdentitiesLive;
+            const storageBuckets = copyCounts['storage.buckets'] ?? storageBucketsLive;
+            const storageObjects = copyCounts['storage.objects'] ?? storageObjectsLive;
+            const customLoginRoles = roleLoginNames(roles);
+          
+            const components = {};
+            for (const f of [roles, schema, data, ...(hasMigrationHistory ? [histSchema, histData] : [])]) {
+              components[path.basename(f)] = { sha256: sha256File(f), bytes: fs.statSync(f).size };
+            }
+          
+            const manifest = {
+              format: backupFormat,
+              format_version: 1,
+              source_slug: slug,
+              created_at_utc: new Date().toISOString(),
+              backup_started_at_utc: backupStartedAt,
+              audit_revision: 'backup-v14',
+              snapshot_scope: 'data.sql has its own pg_dump snapshot; separate components are stability-checked, not a shared snapshot',
+              filename_timestamp: stamp,
+              filename_timezone: 'Asia/Ho_Chi_Minh',
+              filename_family: filenameFamily,
+              filename_run_token: artifactToken,
+              github_repository_id: githubRepositoryId || null,
+              github_run_id: githubRunId || null,
+              github_run_attempt: githubRunAttempt || null,
+              supabase_cli_version: process.env.SUPABASE_CLI_VERSION || 'unknown',
+              postgres_server_version: serverVersion,
+              database_size_bytes: databaseSizeBytes,
+              components,
+              has_migration_history: hasMigrationHistory,
+              core_dump_stability: {
+                schema_unchanged_across_data_dump: true,
+                roles_unchanged_across_data_dump: true,
+                migration_history_unchanged_across_backup: true,
+                fingerprint_method: 'exact-sql-minus-pgdump-restrict-guards'
+              },
+              verification: {
+                copy_row_counts: copyCounts,
+                auth_users_count: authUsers,
+                auth_identities_count: authIdentities,
+                storage_buckets_count: storageBuckets,
+                storage_objects_count: storageObjects,
+                vault_secrets_count: vaultSecrets,
+                extensions,
+                realtime_publication_tables: realtimeTables,
+                managed_schema_signatures: managed,
+                custom_login_roles: customLoginRoles
+              },
+              limitations: {
+                storage_object_files_included: false,
+                auth_storage_custom_schema_automatically_recreated: false,
+                encryption_root_key_included: false,
+                edge_functions_included: false,
+                auth_settings_and_api_keys_included: false
+              }
+            };
+          
+            fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n', { mode: 0o600 });
+            fs.copyFileSync(manifestPath, sideManifest);
+          
+            const archiveFiles = ['roles.sql', 'schema.sql', 'data.sql', 'manifest.json'];
+            if (hasMigrationHistory) archiveFiles.push('history_schema.sql', 'history_data.sql');
+            await run('tar', ['-czf', path.resolve(bundle), '-C', dir, ...archiveFiles], { echoStderr: false });
+            await run('tar', ['-tzf', bundle], { echoStderr: false });
+          
+            const bundleSha = sha256File(bundle);
+            fs.writeFileSync(shaFile, `${bundleSha}  ${path.basename(bundle)}\n`, { mode: 0o600 });
+          
+            // Raw SQL files are no longer needed after the archive, sidecar manifest and checksum
+            // have been created. Removing them here substantially reduces local disk pressure when
+            // many large schools are backed up sequentially on a 14-GB GitHub-hosted runner.
+            fs.rmSync(dir, { recursive: true, force: true });
+          
+            console.log(`OK [${slug}] ${bundle}`);
+            return { slug, bundle, shaFile, manifest: sideManifest, bundleSha, createdAt: manifest.created_at_utc };
+          }
+          
+          async function main() {
+            let sql = 'SELECT slug, supabase_sql FROM danh_sach_truong';
+            const params = [];
+            if (inputSlug) {
+              sql += ' WHERE slug = ?';
+              params.push(inputSlug);
+            }
+            sql += ' ORDER BY slug';
+            const rows = await d1Query(sql, params);
+            if (!rows.length) throw new Error(inputSlug ? `No D1 row found for slug [${inputSlug}].` : 'No school rows found in D1.');
+          
+            const seenSlugs = new Set();
+            for (const row of rows) {
+              const slug = String(row.slug || '').trim();
+              if (!/^[A-Za-z0-9_-]+$/.test(slug) || seenSlugs.has(slug)) throw new Error(`Invalid or duplicate D1 slug: ${slug}`);
+              seenSlugs.add(slug);
+            }
+            fs.mkdirSync('backups_cli', { recursive: true });
+            const results = [];
+            const failures = [];
+            for (const row of rows) {
+              try {
+                const item = await backupOne(row);
+                item.uploadVerified = await require('./upload_r2.js').uploadOne(item);
+                results.push(item);
+                if (item.uploadVerified) for (const file of [item.bundle,item.shaFile,item.manifest]) fs.rmSync(file,{force:true});
+              } catch (e) {
+                const slug = String(row.slug || 'unknown');
+                const msg = safeError(e);
+                failures.push({ slug, error: msg });
+                console.error(`FAILED [${slug}]: ${msg}`);
+              }
+            }
+          
+            fs.writeFileSync('backup_results.json', JSON.stringify({ results, failures }, null, 2) + '\n');
+            console.log(`\nBackup creation summary: success=${results.length}, failed=${failures.length}, total=${rows.length}`);
+            if (!results.length) process.exit(2);
+          }
+          
+          main().catch(err => {
+            console.error(`FATAL: ${safeError(err)}`);
+            process.exit(1);
+          });
+          NODE
+          node backup_cli.js
+
+      - name: Upload verified backup sets to R2 and apply retention
+        env:
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          : "${R2_BUCKET_NAME:?Missing R2_BUCKET_NAME}"
+          node upload_r2.js
+
+      - name: Cleanup local credentials and backup files
+        if: always()
+        run: |
+          set +e
+          rm -f ~/.config/rclone/rclone.conf
+          rm -rf backups_cli backup_cli.js upload_r2.js backup_results.json
