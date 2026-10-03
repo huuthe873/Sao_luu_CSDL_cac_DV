@@ -1,4 +1,4 @@
-name: Khoi_phuc_moi_nhat_02.10
+name: Khoi_phuc_moi_nhat_v19_03.10
 
 on:
   workflow_dispatch:
@@ -106,7 +106,7 @@ jobs:
           INPUT_BACKUP_FILE: ${{ github.event.inputs.backup_file }}
         run: |
           set -euo pipefail
-          cat > restore_direct_v14.js <<'NODE'
+          cat > restore_direct_v19.js <<'NODE'
           const fs = require('fs');
           const path = require('path');
           const crypto = require('crypto');
@@ -122,6 +122,9 @@ jobs:
           const expectedFormat = process.env.BACKUP_FORMAT || 'supabase-cli-r2-v1';
           const suffix = (process.env.INPUT_SUFFIX || '').trim();
           const requestedFile = (process.env.INPUT_BACKUP_FILE || '').trim();
+          const restoreGuardSchema = '_supabase_backup_restore_internal';
+          const restoreGuardComment = 'Internal commit marker for automated Supabase backup/restore workflow';
+          const restoreRunId = `${process.env.GITHUB_RUN_ID || 'local'}-${process.env.GITHUB_RUN_ATTEMPT || '0'}-${Date.now()}-${suffix}`;
 
           if (!cfAccountId || !cfApiToken || !cfDbId) throw new Error('Missing Cloudflare D1 secrets.');
           if (!bucket) throw new Error('Missing R2_BUCKET_NAME.');
@@ -131,7 +134,7 @@ jobs:
             'auth', 'storage', 'realtime', 'graphql', 'graphql_public',
             'extensions', 'pgbouncer', 'pgsodium', 'pgsodium_masks',
             'vault', 'cron', 'supabase_functions', 'supabase_migrations',
-            'net', '_realtime', '_analytics'
+            'net', '_realtime', '_analytics', restoreGuardSchema
           ]);
 
           function safeError(err) {
@@ -258,6 +261,83 @@ jobs:
             throw lastErr;
           }
 
+          function sqlLiteral(value) { return "'" + String(value).replace(/'/g, "''") + "'"; }
+
+          async function inspectRestoreGuard(dbUrl) {
+            const out = await psql(dbUrl, `
+              SELECT CASE
+                WHEN to_regnamespace(${sqlLiteral(restoreGuardSchema)}) IS NULL THEN 'absent'
+                WHEN COALESCE(obj_description(to_regnamespace(${sqlLiteral(restoreGuardSchema)}), 'pg_namespace'), '') = ${sqlLiteral(restoreGuardComment)} THEN 'owned'
+                ELSE 'conflict'
+              END;`);
+            return out.trim();
+          }
+
+          async function cleanupOwnedRestoreGuard(dbUrl) {
+            const state = await inspectRestoreGuard(dbUrl);
+            if (state === 'absent') return;
+            if (state !== 'owned') {
+              throw new Error(`Reserved internal schema ${restoreGuardSchema} already exists but is not owned by this workflow. Refusing to modify it.`);
+            }
+            await psql(dbUrl, `DROP SCHEMA IF EXISTS "${restoreGuardSchema}" CASCADE;`);
+            console.log(`Removed stale internal restore marker schema [${restoreGuardSchema}].`);
+          }
+
+          function makeCommitMarkerSql(file, backupName, sourceSlug) {
+            const lines = [
+              '-- Durable commit marker. It is created inside the SAME transaction and therefore',
+              '-- proves COMMIT outcome after a network disconnect. It is removed after final verification.',
+              `DO $guard$ BEGIN IF to_regnamespace(${sqlLiteral(restoreGuardSchema)}) IS NOT NULL AND COALESCE(obj_description(to_regnamespace(${sqlLiteral(restoreGuardSchema)}), 'pg_namespace'), '') <> ${sqlLiteral(restoreGuardComment)} THEN RAISE EXCEPTION 'Reserved restore guard schema exists with an unexpected owner/comment'; END IF; END $guard$;`,
+              `CREATE SCHEMA IF NOT EXISTS "${restoreGuardSchema}";`,
+              `COMMENT ON SCHEMA "${restoreGuardSchema}" IS ${sqlLiteral(restoreGuardComment)};`,
+              `CREATE TABLE IF NOT EXISTS "${restoreGuardSchema}".commits (restore_id text PRIMARY KEY, backup_name text NOT NULL, source_slug text, target_slug text NOT NULL, committed_at timestamptz NOT NULL DEFAULT clock_timestamp());`,
+              `INSERT INTO "${restoreGuardSchema}".commits(restore_id, backup_name, source_slug, target_slug) VALUES (${sqlLiteral(restoreRunId)}, ${sqlLiteral(backupName)}, ${sqlLiteral(sourceSlug || '')}, ${sqlLiteral(suffix)}) ON CONFLICT (restore_id) DO UPDATE SET backup_name = EXCLUDED.backup_name, source_slug = EXCLUDED.source_slug, target_slug = EXCLUDED.target_slug, committed_at = clock_timestamp();`
+            ];
+            fs.writeFileSync(file, lines.join('\n') + '\n');
+          }
+
+          async function commitMarkerExists(dbUrl, backupName) {
+            const state = await inspectRestoreGuard(dbUrl);
+            if (state === 'absent') return false;
+            if (state !== 'owned') throw new Error(`Restore commit marker schema conflict detected after transaction.`);
+            const out = await psql(dbUrl, `
+              SELECT CASE WHEN EXISTS (
+                SELECT 1 FROM "${restoreGuardSchema}".commits
+                WHERE restore_id = ${sqlLiteral(restoreRunId)}
+                  AND backup_name = ${sqlLiteral(backupName)}
+                  AND target_slug = ${sqlLiteral(suffix)}
+              ) THEN '1' ELSE '0' END;`);
+            return out.trim() === '1';
+          }
+
+          async function resolveTransientRestoreOutcome(dbUrl, backupName, context) {
+            // Never infer COMMIT from row counts. The transaction-local marker is authoritative.
+            // A server that received COMMIT can become visible a moment after the client loses its
+            // socket, so do not treat one immediate "marker absent" read as final. Poll for a short,
+            // bounded window. If the DB is never reachable, fail as ambiguous rather than replaying.
+            const delaysSeconds = [0, 2, 5, 10, 15];
+            let reachableChecks = 0;
+            let lastErr = null;
+            for (const delay of delaysSeconds) {
+              if (delay) await sleep(delay * 1000);
+              try {
+                const committed = await commitMarkerExists(dbUrl, backupName);
+                reachableChecks++;
+                if (committed) {
+                  console.warn(`${context}: network connection was lost, but the durable in-transaction commit marker is present. COMMIT is confirmed.`);
+                  return 'committed';
+                }
+              } catch (e) {
+                lastErr = e;
+              }
+            }
+            if (reachableChecks === delaysSeconds.length) {
+              console.warn(`${context}: durable commit marker remained absent across ${reachableChecks} reachable checks over the bounded confirmation window. Treating the transaction as NOT committed.`);
+              return 'not_committed';
+            }
+            throw new Error(`${context}: RESTORE OUTCOME IS AMBIGUOUS because the database was not consistently reachable long enough to determine the durable commit marker state. Automatic retry is intentionally stopped to avoid a false success or unintended replay. Last marker-check error: ${safeError(lastErr)}`);
+          }
+
           async function dumpWithRetry(dbUrl, outputFile, extraArgs, label) {
             const maintenanceUrl = maintenanceDbUrl(dbUrl);
             let lastErr;
@@ -382,8 +462,6 @@ jobs:
             return layouts;
           }
 
-          function sqlLiteral(value) { return "'" + String(value).replace(/'/g, "''") + "'"; }
-
           async function getTargetColumnMeta(dbUrl, key) {
             const q = sqlLiteral(key);
             const out = await psql(dbUrl, `
@@ -458,16 +536,18 @@ jobs:
             return Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
           }
 
-          function normalizeSql(text) {
-            return text.split(/\r?\n/)
-              .map(s => s.trim())
-              .filter(s => s && !s.startsWith('--') && !/^\\(?:un)?restrict\b/i.test(s))
-              .map(s => s.replace(/\s+/g, ' '))
+          function dumpSemanticFingerprint(file) {
+            // Preserve SQL semantics exactly. Ignore only PostgreSQL 17 pg_dump's random
+            // \restrict/\unrestrict guard lines; never collapse whitespace/comments/literals.
+            const text = fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+            const canonical = text.split('\n')
+              .filter(line => !/^\s*\\(?:un)?restrict\b/i.test(line))
               .join('\n');
+            return crypto.createHash('sha256').update(canonical, 'utf8').digest('hex');
           }
 
           function schemaFingerprint(file) {
-            return crypto.createHash('sha256').update(normalizeSql(fs.readFileSync(file, 'utf8'))).digest('hex');
+            return dumpSemanticFingerprint(file);
           }
 
           async function collectManagedSignatures(dbUrl) {
@@ -507,12 +587,12 @@ jobs:
             const appRelations = Number(await psql(dbUrl, `
               SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
               WHERE c.relkind IN ('r','p','v','m','S')
-                AND n.nspname NOT IN ('auth','storage','realtime','graphql','graphql_public','extensions','pgbouncer','pgsodium','pgsodium_masks','vault','cron','supabase_functions','supabase_migrations','net','_realtime','_analytics','information_schema')
+                AND n.nspname NOT IN ('auth','storage','realtime','graphql','graphql_public','extensions','pgbouncer','pgsodium','pgsodium_masks','vault','cron','supabase_functions','supabase_migrations','net','_realtime','_analytics','_supabase_backup_restore_internal','information_schema')
                 AND n.nspname NOT LIKE 'pg_%'
                 AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid=c.oid AND d.deptype='e');`));
             const appFunctions = Number(await psql(dbUrl, `
               SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
-              WHERE n.nspname NOT IN ('auth','storage','realtime','graphql','graphql_public','extensions','pgbouncer','pgsodium','pgsodium_masks','vault','cron','supabase_functions','supabase_migrations','net','_realtime','_analytics','information_schema')
+              WHERE n.nspname NOT IN ('auth','storage','realtime','graphql','graphql_public','extensions','pgbouncer','pgsodium','pgsodium_masks','vault','cron','supabase_functions','supabase_migrations','net','_realtime','_analytics','_supabase_backup_restore_internal','information_schema')
                 AND n.nspname NOT LIKE 'pg_%'
                 AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid=p.oid AND d.deptype='e');`));
             const authUsers = await countTable(dbUrl, 'auth.users');
@@ -553,23 +633,35 @@ jobs:
           }
 
           function validVietnamStampToEpoch(stamp) {
-            const m = String(stamp || '').match(/^(\d{2})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{4})$/);
+            // Accept both v12 millisecond stamps and v11 second-only stamps.
+            const m = String(stamp || '').match(/^(\d{2})-(\d{2})-(\d{2})(?:-(\d{3}))?_(\d{2})-(\d{2})-(\d{4})$/);
             if (!m) return null;
-            const [, hh, mm, ss, dd, mo, yyyy] = m.map((x, i) => i === 0 ? x : Number(x));
-            if (hh > 23 || mm > 59 || ss > 59 || mo < 1 || mo > 12 || dd < 1 || dd > 31) return null;
-            const epochMs = Date.UTC(yyyy, mo - 1, dd, hh - 7, mm, ss);
+            const hh = Number(m[1]), mm = Number(m[2]), ss = Number(m[3]);
+            const millis = m[4] ? Number(m[4]) : 0;
+            const dd = Number(m[5]), mo = Number(m[6]), yyyy = Number(m[7]);
+            if (hh > 23 || mm > 59 || ss > 59 || millis > 999 || mo < 1 || mo > 12 || dd < 1 || dd > 31) return null;
+            const epochMs = Date.UTC(yyyy, mo - 1, dd, hh - 7, mm, ss, millis);
             const check = new Date(epochMs + 7 * 3600 * 1000);
             if (check.getUTCFullYear() !== yyyy || check.getUTCMonth() + 1 !== mo || check.getUTCDate() !== dd ||
-                check.getUTCHours() !== hh || check.getUTCMinutes() !== mm || check.getUTCSeconds() !== ss) return null;
+                check.getUTCHours() !== hh || check.getUTCMinutes() !== mm || check.getUTCSeconds() !== ss ||
+                check.getUTCMilliseconds() !== millis) return null;
             return epochMs;
           }
 
           function snapshotTimeForName(name) {
             const escSlug = suffix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-            // Current short family, Vietnam local time (UTC+7):
+            // v12 collision-safe family:
+            // <slug>_<HH-MM-SS-mmm>_<DD-MM-YYYY>_<run-token>.tar.gz
+            let m = String(name || '').match(new RegExp(`^${escSlug}_(\\d{2}-\\d{2}-\\d{2}-\\d{3}_\\d{2}-\\d{2}-\\d{4})_([A-Za-z0-9-]+)\\.tar\\.gz$`));
+            if (m) {
+              const epochMs = validVietnamStampToEpoch(m[1]);
+              if (epochMs !== null) return epochMs;
+            }
+
+            // Backward compatibility with v11 second-only names:
             // <slug>_<HH-MM-SS>_<DD-MM-YYYY>.tar.gz
-            let m = String(name || '').match(new RegExp(`^${escSlug}_(\\d{2}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{4})\\.tar\\.gz$`));
+            m = String(name || '').match(new RegExp(`^${escSlug}_(\\d{2}-\\d{2}-\\d{2}_\\d{2}-\\d{2}-\\d{4})\\.tar\\.gz$`));
             if (m) {
               const epochMs = validVietnamStampToEpoch(m[1]);
               if (epochMs !== null) return epochMs;
@@ -607,19 +699,7 @@ jobs:
               return { remoteDir: defaultDir, name: wanted };
             }
 
-            const root = `r2:${bucket}/${prefix}`;
-            const { stdout } = await run('rclone', ['lsjson', root, '--recursive', '--files-only', '--s3-no-check-bucket'], { echoStderr: false });
-            const all = JSON.parse(stdout || '[]');
-            const candidates = all.filter(f => path.posix.basename(f.Path) === wanted);
-            const complete = [];
-            const allNames = new Set(all.map(f => f.Path));
-            for (const c of candidates) {
-              if (allNames.has(`${c.Path}.sha256`) && allNames.has(`${c.Path}.manifest.json`)) complete.push(c.Path);
-            }
-            if (complete.length === 0) throw new Error(`Backup [${wanted}] was not found as a complete set in R2.`);
-            if (complete.length > 1) throw new Error(`Backup filename [${wanted}] exists in multiple R2 folders. Use a unique filename.`);
-            const full = complete[0];
-            return { remoteDir: `${root}/${path.posix.dirname(full)}`, name: path.posix.basename(full) };
+            throw new Error(`Backup [${wanted}] was not found as a complete set inside the target school's folder [${prefix}/${suffix}]. Cross-school restore is intentionally disabled.`);
           }
 
           async function downloadAndVerifyBackup() {
@@ -645,6 +725,7 @@ jobs:
 
             const { stdout: listOut } = await run('tar', ['-tzf', localBundle]);
             const entries = listOut.split(/\r?\n/).filter(Boolean);
+            if (entries.length !== new Set(entries).size) throw new Error('Backup archive contains duplicate entries. Refusing extraction.');
             const allowed = new Set(['roles.sql','schema.sql','data.sql','manifest.json','history_schema.sql','history_data.sql']);
             for (const e of entries) {
               if (e.startsWith('/') || e.includes('..') || !allowed.has(e)) throw new Error(`Unsafe or unexpected archive entry: ${e}`);
@@ -653,16 +734,57 @@ jobs:
             await run('tar', ['-xzf', localBundle, '--no-same-owner', '--no-same-permissions', '-C', 'restore_work']);
             const insideManifest = JSON.parse(fs.readFileSync(path.join('restore_work', 'manifest.json'), 'utf8'));
             if (JSON.stringify(insideManifest) !== JSON.stringify(outsideManifest)) throw new Error('Inside and sidecar manifests differ.');
-            for (const [file, meta] of Object.entries(insideManifest.components || {})) {
+
+            const allowedComponents = new Set(['roles.sql','schema.sql','data.sql','history_schema.sql','history_data.sql']);
+            const components = insideManifest.components;
+            if (!components || typeof components !== 'object' || Array.isArray(components)) throw new Error('Manifest components object is missing or invalid.');
+            for (const required of ['roles.sql','schema.sql','data.sql']) {
+              if (!Object.prototype.hasOwnProperty.call(components, required)) throw new Error(`Manifest is missing required component metadata: ${required}`);
+            }
+            const historyEntriesPresent = entries.includes('history_schema.sql') || entries.includes('history_data.sql');
+            if (insideManifest.has_migration_history === true) {
+              if (!entries.includes('history_schema.sql') || !entries.includes('history_data.sql') ||
+                  !components['history_schema.sql'] || !components['history_data.sql']) {
+                throw new Error('Manifest says migration history is present, but the archive/components are incomplete.');
+              }
+            } else if (historyEntriesPresent || components['history_schema.sql'] || components['history_data.sql']) {
+              throw new Error('Archive contains migration-history files but manifest.has_migration_history is not true.');
+            }
+
+            for (const [file, meta] of Object.entries(components)) {
+              if (!allowedComponents.has(file)) throw new Error(`Manifest contains unexpected component name: ${file}`);
+              if (!meta || typeof meta !== 'object' || !/^[a-f0-9]{64}$/i.test(String(meta.sha256 || ''))) throw new Error(`Manifest has invalid SHA-256 metadata for ${file}`);
+              if (!Number.isSafeInteger(Number(meta.bytes)) || Number(meta.bytes) < 0) throw new Error(`Manifest has invalid byte length for ${file}`);
               const f = path.join('restore_work', file);
               if (!fs.existsSync(f)) throw new Error(`Manifest component missing: ${file}`);
-              if (sha256File(f) !== meta.sha256) throw new Error(`Component SHA-256 mismatch: ${file}`);
+              if (fs.statSync(f).size !== Number(meta.bytes)) throw new Error(`Component byte-length mismatch: ${file}`);
+              if (sha256File(f) !== String(meta.sha256).toLowerCase()) throw new Error(`Component SHA-256 mismatch: ${file}`);
+            }
+
+            // Cross-check manifest row counts against the exact extracted data.sql before touching
+            // the target. This turns the already-streaming parser into an independent manifest/data
+            // consistency gate and prevents a malformed manifest from driving destructive verification.
+            const parsedDataCounts = await parseCopyCounts(path.join('restore_work', 'data.sql'));
+            for (const [key, rawExpected] of Object.entries(insideManifest.verification?.copy_row_counts || {})) {
+              const expectedCount = Number(rawExpected);
+              if (!Number.isSafeInteger(expectedCount) || expectedCount < 0 || !Object.prototype.hasOwnProperty.call(parsedDataCounts, key) || Number(parsedDataCounts[key]) !== expectedCount) {
+                throw new Error(`Manifest/data.sql row-count mismatch for ${key}.`);
+              }
+            }
+            for (const [key, manifestKey] of [['auth.users','auth_users_count'],['auth.identities','auth_identities_count'],['storage.buckets','storage_buckets_count'],['storage.objects','storage_objects_count']]) {
+              const expectedCount = Number(insideManifest.verification?.[manifestKey]);
+              if (!Number.isSafeInteger(expectedCount) || expectedCount < 0 || !Object.prototype.hasOwnProperty.call(parsedDataCounts, key) || Number(parsedDataCounts[key]) !== expectedCount) {
+                throw new Error(`Critical manifest/data.sql count mismatch for ${key}.`);
+              }
             }
             console.log(`Selected backup: ${loc.name}`);
             console.log(`Backup source slug: ${insideManifest.source_slug || 'unknown'}; target suffix: ${suffix}`);
-            if (insideManifest.source_slug && insideManifest.source_slug !== suffix) {
-              console.warn(`WARNING: cross-school restore requested by explicit backup selection: [${insideManifest.source_slug}] -> [${suffix}].`);
+            if (!insideManifest.source_slug || insideManifest.source_slug !== suffix) {
+              throw new Error(`Backup source slug [${insideManifest.source_slug || 'missing'}] does not match target suffix [${suffix}]. Cross-school restore is disabled.`);
             }
+            // The compressed bundle and sidecars are no longer needed after extraction plus
+            // component-hash verification. Free them early to reduce GitHub-runner disk pressure.
+            for (const f of [localBundle, localSha, localManifest]) fs.rmSync(f, { force: true });
             return { name: loc.name, manifest: insideManifest };
           }
 
@@ -739,6 +861,200 @@ jobs:
             return checks.size;
           }
 
+          function makePostLoadIntegritySql(tableKeys, file, options = {}) {
+            const keys = [...new Set((tableKeys || []).map(String))].sort();
+            if (!keys.length) throw new Error('Cannot prepare post-load integrity checks: no restored tables were found.');
+            const restoredArray = `ARRAY[${keys.map(sqlLiteral).join(',')}]::text[]`;
+            const managedArray = `ARRAY[${[...managedSchemas].sort().map(sqlLiteral).join(',')}]::text[]`;
+            const repairSequences = options.repairSequences === true;
+            const lines = [
+              '-- Post-load integrity gate. Runs inside the same restore transaction.',
+              'SET session_replication_role = origin;'
+            ];
+
+            // Validate all restored foreign keys BEFORE any sequence repair. Managed-sequence
+            // fallback uses setval(), whose state change is not rolled back by PostgreSQL, so all
+            // other hard integrity gates must run first.
+            lines.push(`DO $fk_guard$
+          DECLARE
+            r record;
+            v_all_nonnull text;
+            v_all_null text;
+            v_join text;
+            v_where text;
+            v_bad boolean;
+          BEGIN
+            FOR r IN
+              SELECT c.oid, c.conname, c.conrelid, c.confrelid, c.conkey, c.confkey, c.confmatchtype,
+           cn.nspname AS child_schema, cc.relname AS child_table,
+           pn.nspname AS parent_schema, pc.relname AS parent_table
+              FROM pg_constraint c
+              JOIN pg_class cc ON cc.oid = c.conrelid
+              JOIN pg_namespace cn ON cn.oid = cc.relnamespace
+              JOIN pg_class pc ON pc.oid = c.confrelid
+              JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+              WHERE c.contype = 'f'
+                AND c.convalidated
+                AND (cn.nspname || '.' || cc.relname) = ANY (${restoredArray})
+            LOOP
+              IF r.confmatchtype = 'p' THEN
+                RAISE EXCEPTION 'MATCH PARTIAL foreign key is not supported by integrity checker: %.% constraint %', r.child_schema, r.child_table, r.conname;
+              END IF;
+
+              SELECT string_agg(format('c.%I IS NOT NULL', ca.attname), ' AND ' ORDER BY ck.ord),
+           string_agg(format('c.%I IS NULL', ca.attname), ' AND ' ORDER BY ck.ord),
+           string_agg(format('p.%I = c.%I', pa.attname, ca.attname), ' AND ' ORDER BY ck.ord)
+                INTO v_all_nonnull, v_all_null, v_join
+              FROM unnest(r.conkey) WITH ORDINALITY AS ck(attnum, ord)
+              JOIN unnest(r.confkey) WITH ORDINALITY AS pk(attnum, ord) USING (ord)
+              JOIN pg_attribute ca ON ca.attrelid = r.conrelid AND ca.attnum = ck.attnum
+              JOIN pg_attribute pa ON pa.attrelid = r.confrelid AND pa.attnum = pk.attnum;
+
+              IF v_all_nonnull IS NULL OR v_join IS NULL THEN
+                RAISE EXCEPTION 'Could not derive foreign-key columns for %.% constraint %', r.child_schema, r.child_table, r.conname;
+              END IF;
+
+              IF r.confmatchtype = 'f' THEN
+                v_where := format('((NOT (%s) AND NOT (%s)) OR ((%s) AND NOT EXISTS (SELECT 1 FROM %I.%I p WHERE %s)))',
+                        v_all_null, v_all_nonnull, v_all_nonnull, r.parent_schema, r.parent_table, v_join);
+              ELSE
+                v_where := format('((%s) AND NOT EXISTS (SELECT 1 FROM %I.%I p WHERE %s))',
+                        v_all_nonnull, r.parent_schema, r.parent_table, v_join);
+              END IF;
+
+              EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I.%I c WHERE %s LIMIT 1)', r.child_schema, r.child_table, v_where) INTO v_bad;
+              IF v_bad THEN
+                RAISE EXCEPTION 'Foreign-key integrity verification failed: %.% constraint % -> %.%',
+                      r.child_schema, r.child_table, r.conname, r.parent_schema, r.parent_table;
+              END IF;
+            END LOOP;
+          END $fk_guard$;`);
+
+            if (repairSequences) {
+              lines.push(`DO $seq_guard$
+          DECLARE
+            r record;
+            v_extreme numeric;
+            v_last numeric;
+            v_called boolean;
+            v_current_next numeric;
+            v_step numeric;
+            v_steps numeric;
+            v_restart numeric;
+            v_collision boolean;
+            v_is_managed boolean;
+            v_used_setval boolean;
+          BEGIN
+            FOR r IN
+              SELECT s.oid AS seq_oid,
+           pg_get_userbyid(s.relowner) AS seq_owner,
+           sns.nspname AS seq_schema, s.relname AS seq_name,
+           tns.nspname AS table_schema, t.relname AS table_name,
+           a.attname AS column_name, ps.increment_by::numeric AS increment_by,
+           ps.min_value::numeric AS min_value, ps.max_value::numeric AS max_value,
+           ps.cycle AS cycle,
+           has_sequence_privilege(current_user, s.oid, 'UPDATE') AS can_setval
+              FROM pg_class s
+              JOIN pg_namespace sns ON sns.oid = s.relnamespace
+              JOIN pg_depend d ON d.classid = 'pg_class'::regclass AND d.objid = s.oid
+                    AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a','i')
+              JOIN pg_class t ON t.oid = d.refobjid
+              JOIN pg_namespace tns ON tns.oid = t.relnamespace
+              JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = d.refobjsubid
+              JOIN pg_sequences ps ON ps.schemaname = sns.nspname AND ps.sequencename = s.relname
+              WHERE s.relkind = 'S'
+                AND (tns.nspname || '.' || t.relname) = ANY (${restoredArray})
+                AND tns.nspname NOT LIKE 'pg_%' AND tns.nspname <> 'information_schema'
+            LOOP
+              IF r.increment_by = 0 THEN
+                RAISE EXCEPTION 'Sequence %.% has zero increment', r.seq_schema, r.seq_name;
+              END IF;
+              v_step := abs(r.increment_by);
+
+              IF r.increment_by > 0 THEN
+                EXECUTE format('SELECT max(%I)::numeric FROM %I.%I', r.column_name, r.table_schema, r.table_name) INTO v_extreme;
+              ELSE
+                EXECUTE format('SELECT min(%I)::numeric FROM %I.%I', r.column_name, r.table_schema, r.table_name) INTO v_extreme;
+              END IF;
+              IF v_extreme IS NULL THEN CONTINUE; END IF;
+
+              EXECUTE format('SELECT last_value::numeric, is_called FROM %I.%I', r.seq_schema, r.seq_name) INTO v_last, v_called;
+              v_current_next := CASE WHEN v_called THEN v_last + r.increment_by ELSE v_last END;
+              v_is_managed := (r.table_schema = ANY (${managedArray}) OR r.seq_schema = ANY (${managedArray}));
+
+              -- A collision means the current sequence phase will eventually generate an ID that
+              -- already exists in the restored rows. We do not merely test current_next itself;
+              -- we test the whole arithmetic progression from current_next through the data range.
+              IF r.increment_by > 0 THEN
+                EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I.%I WHERE %I IS NOT NULL AND %I::numeric >= $1 AND mod(%I::numeric - $1, $2) = 0)',
+                               r.table_schema, r.table_name, r.column_name, r.column_name, r.column_name)
+                  INTO v_collision USING v_current_next, v_step;
+              ELSE
+                EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I.%I WHERE %I IS NOT NULL AND %I::numeric <= $1 AND mod($1 - %I::numeric, $2) = 0)',
+                               r.table_schema, r.table_name, r.column_name, r.column_name, r.column_name)
+                  INTO v_collision USING v_current_next, v_step;
+              END IF;
+              IF NOT v_collision THEN CONTINUE; END IF;
+
+              -- Preserve the target sequence phase and ADVANCE ONLY. Never move a sequence backward.
+              -- This is important because setval() is not transactional: if COMMIT later becomes
+              -- ambiguous/aborts, the only possible leaked effect is a harmless forward gap.
+              IF r.increment_by > 0 THEN
+                v_steps := floor((v_extreme - v_current_next) / v_step) + 1;
+                v_restart := v_current_next + (v_steps * v_step);
+                IF v_restart > r.max_value THEN
+                  RAISE EXCEPTION 'Sequence %.% has no collision-free restart value within max_value after restore', r.seq_schema, r.seq_name;
+                END IF;
+              ELSE
+                v_steps := floor((v_current_next - v_extreme) / v_step) + 1;
+                v_restart := v_current_next - (v_steps * v_step);
+                IF v_restart < r.min_value THEN
+                  RAISE EXCEPTION 'Sequence %.% has no collision-free restart value within min_value after restore', r.seq_schema, r.seq_name;
+                END IF;
+              END IF;
+
+              IF r.can_setval IS NOT TRUE AND v_is_managed THEN
+                RAISE EXCEPTION 'Managed sequence %.% must advance from % to % after restore, but current role % has no UPDATE privilege on the sequence (owner=%). Refusing COMMIT to prevent a future duplicate-key collision.',
+                  r.seq_schema, r.seq_name, v_current_next, v_restart, current_user, r.seq_owner;
+              END IF;
+
+              v_used_setval := false;
+              IF v_is_managed THEN
+                -- Supabase-managed sequences are usually owned by a service role (for example
+                -- supabase_auth_admin), so ALTER SEQUENCE can require ownership even though the
+                -- postgres maintenance role has UPDATE privilege. setval() changes only runtime
+                -- sequence state, not ownership/DDL. It is deliberately executed at the very end
+                -- of all hard restore checks and only advances the sequence.
+                PERFORM pg_catalog.setval(r.seq_oid::regclass, v_restart::bigint, false);
+                v_used_setval := true;
+              ELSE
+                BEGIN
+                  -- Prefer transactional RESTART for application-owned sequences when ownership permits.
+                  EXECUTE format('ALTER SEQUENCE %I.%I RESTART WITH %s', r.seq_schema, r.seq_name, v_restart);
+                EXCEPTION WHEN insufficient_privilege THEN
+                  IF r.can_setval IS NOT TRUE THEN
+                    RAISE EXCEPTION 'Sequence %.% must advance from % to % after restore, but current role % neither owns it nor has UPDATE privilege (owner=%).',
+                      r.seq_schema, r.seq_name, v_current_next, v_restart, current_user, r.seq_owner;
+                  END IF;
+                  PERFORM pg_catalog.setval(r.seq_oid::regclass, v_restart::bigint, false);
+                  v_used_setval := true;
+                END;
+              END IF;
+
+              IF v_used_setval THEN
+                RAISE NOTICE 'Sequence safety repair via setval: %.% next value advanced from % to % for %.%.',
+                  r.seq_schema, r.seq_name, v_current_next, v_restart, r.table_schema, r.table_name;
+              ELSE
+                RAISE NOTICE 'Sequence safety repair via transactional RESTART: %.% next value advanced from % to % for %.%.',
+                  r.seq_schema, r.seq_name, v_current_next, v_restart, r.table_schema, r.table_name;
+              END IF;
+            END LOOP;
+          END $seq_guard$;`);
+            }
+
+            fs.writeFileSync(file, lines.join('\n') + '\n');
+          }
+
           async function captureCurrentSchemaForPreflight(dbUrl) {
             // This is NOT a safety backup and is never uploaded to R2. It is a temporary
             // local schema snapshot used only to compare/preflight an existing target.
@@ -765,13 +1081,18 @@ jobs:
             }
           }
 
-          async function restoreCleanTarget(dbUrl, manifest) {
+          async function restoreCleanTarget(dbUrl, manifest, backupName) {
             await ensureExtensions(dbUrl, manifest);
             const realtimeFile = path.resolve('restore_work/realtime.sql');
             await makeRealtimeSql(manifest, dbUrl, realtimeFile);
+            const cleanLayouts = await parseCopyLayouts('restore_work/data.sql');
+            const integrityFile = path.resolve('restore_work/integrity_before_commit.sql');
+            makePostLoadIntegritySql([...cleanLayouts.keys()], integrityFile, { repairSequences: false });
             const transactionalVerifyFile = path.resolve('restore_work/verify_before_commit.sql');
             const transactionalChecks = makeTransactionalVerificationSql(manifest, transactionalVerifyFile);
-            console.log(`Prepared ${transactionalChecks} hard row-count check(s) to execute before COMMIT.`);
+            const commitMarkerFile = path.resolve('restore_work/commit_marker.sql');
+            makeCommitMarkerSql(commitMarkerFile, backupName, manifest.source_slug);
+            console.log(`Prepared validated-FK integrity checks plus ${transactionalChecks} hard row-count check(s) and a durable commit marker before COMMIT.`);
             const rolesPath = 'restore_work/roles.sql';
             const schemaPath = 'restore_work/schema.sql';
 
@@ -786,7 +1107,7 @@ jobs:
               if (manifest.has_migration_history && fs.existsSync('restore_work/history_schema.sql') && fs.existsSync('restore_work/history_data.sql')) {
                 args.push('--file',path.resolve('restore_work/history_schema.sql'),'--file',path.resolve('restore_work/history_data.sql'));
               }
-              args.push('--file', realtimeFile, '--file', transactionalVerifyFile);
+              args.push('--file', realtimeFile, '--file', integrityFile, '--file', transactionalVerifyFile, '--file', commitMarkerFile);
               return args;
             };
 
@@ -796,7 +1117,7 @@ jobs:
               const after = before.split(/\r?\n/).map(line => {
                 if (!/^\s*--/.test(line) && matcher(line)) {
                   changed++;
-                  return `-- v13 compatibility (${reason}): ${line}`;
+                  return `-- v19 compatibility (${reason}): ${line}`;
                 }
                 return line;
               }).join('\n');
@@ -827,26 +1148,21 @@ jobs:
               try {
                 console.log(`Clean-target restore transaction attempt ${attempt}/8 ...`);
                 await run('psql', buildArgs(), { env: pgEnvFromUrl(dbUrl), echoStdout: true, echoStderr: true });
-                console.log('Clean-target full logical restore COMMITTED successfully.');
+                if (!(await commitMarkerExists(dbUrl, backupName))) throw new Error('psql returned success but the durable commit marker is missing. Refusing to report restore success.');
+                console.log('Clean-target full logical restore COMMITTED successfully; durable commit marker confirmed.');
                 return;
               } catch (err) {
                 lastErr = err;
                 const msg = safeError(err);
 
                 if (isTransientPgConnectionError(msg)) {
-                  // If the network vanished after COMMIT reached the server, psql may not know
-                  // whether COMMIT succeeded. Verify first; only retry if verification does not pass.
-                  try {
-                    await verifyTarget(dbUrl, manifest, 'clean');
-                    console.warn('Transient connection loss occurred, but post-restore verification PASSED. Treating the restore as committed successfully.');
-                    return;
-                  } catch (_) {
-                    if (attempt < 8) {
-                      const wait = [5, 10, 20, 30, 30, 30, 30][attempt - 1] || 30;
-                      console.warn(`Transient PostgreSQL connection loss; restore outcome was not verified as complete. Retrying the full single-transaction restore in ${wait}s.`);
-                      await sleep(wait * 1000);
-                      continue;
-                    }
+                  const outcome = await resolveTransientRestoreOutcome(dbUrl, backupName, 'Clean-target restore');
+                  if (outcome === 'committed') return;
+                  if (attempt < 8) {
+                    const wait = [5, 10, 20, 30, 30, 30, 30][attempt - 1] || 30;
+                    console.warn(`Clean-target transaction is confirmed NOT committed. Retrying the full single-transaction restore in ${wait}s.`);
+                    await sleep(wait * 1000);
+                    continue;
                   }
                 }
 
@@ -858,15 +1174,15 @@ jobs:
             throw lastErr;
           }
 
-          async function restoreExistingCompatibleTarget(dbUrl, manifest, currentSchemaFile) {
+          async function restoreExistingCompatibleTarget(dbUrl, manifest, currentSchemaFile, backupName) {
             await assertRequiredExtensionsPresent(dbUrl, manifest);
             const backupFp = schemaFingerprint('restore_work/schema.sql');
             const currentFp = schemaFingerprint(currentSchemaFile);
             console.log(`Schema fingerprint backup=${backupFp}`);
             console.log(`Schema fingerprint target=${currentFp}`);
             if (backupFp !== currentFp) {
-              console.warn('Schema dump fingerprints differ. v13 does NOT treat a raw schema.sql hash mismatch as proof of incompatibility because separate Supabase projects can produce different dump text for platform/environment details.');
-              console.warn('v13 will instead run a structural COPY-column preflight, then let PostgreSQL validate the actual data load inside one transaction. Any incompatibility causes a full rollback.');
+              console.warn('Schema dump fingerprints differ. v19 does NOT treat a raw schema.sql hash mismatch as proof of incompatibility because separate Supabase projects can produce different dump text for platform/environment details.');
+              console.warn('v19 will instead run a structural COPY-column preflight, then let PostgreSQL validate the actual data load inside one transaction. Any incompatibility causes a full rollback.');
             } else {
               console.log('Schema dump fingerprints are identical.');
             }
@@ -931,13 +1247,17 @@ jobs:
               inPlaceHistoryData = path.resolve('restore_work/history_data_inplace.sql');
               skippedSetvals += await makeInPlaceDataFile(historyData, inPlaceHistoryData);
             }
-            console.log(`In-place sequence protection: CONTINUE IDENTITY; skipped ${skippedSetvals} pg_dump setval statement(s).`);
+            console.log(`In-place sequence protection: CONTINUE IDENTITY; skipped ${skippedSetvals} source pg_dump setval statement(s). v19 will preserve the target sequence phase and advance only sequences that would collide with restored rows.`);
 
             const realtimeFile = path.resolve('restore_work/realtime.sql');
             await makeRealtimeSql(manifest, dbUrl, realtimeFile);
+            const integrityFile = path.resolve('restore_work/integrity_before_commit.sql');
+            makePostLoadIntegritySql(uniqueTables, integrityFile, { repairSequences: true });
             const transactionalVerifyFile = path.resolve('restore_work/verify_before_commit.sql');
             const transactionalChecks = makeTransactionalVerificationSql(manifest, transactionalVerifyFile);
-            console.log(`Prepared ${transactionalChecks} hard row-count check(s) to execute before COMMIT.`);
+            const commitMarkerFile = path.resolve('restore_work/commit_marker.sql');
+            makeCommitMarkerSql(commitMarkerFile, backupName, manifest.source_slug);
+            console.log(`Prepared ${transactionalChecks} hard row-count check(s), validated-FK checks, a durable commit marker, and forward-only sequence collision repair as the final pre-COMMIT safety step.`);
 
             const args = [
               '-X','--single-transaction','--variable','ON_ERROR_STOP=1',
@@ -948,7 +1268,7 @@ jobs:
               '--file',inPlaceData
             ];
             if (inPlaceHistoryData) args.push('--file',inPlaceHistoryData);
-            args.push('--file', realtimeFile, '--file', transactionalVerifyFile);
+            args.push('--file', realtimeFile, '--file', transactionalVerifyFile, '--file', commitMarkerFile, '--file', integrityFile);
 
             let lastErr;
             for (let attempt = 1; attempt <= 4; attempt++) {
@@ -956,7 +1276,8 @@ jobs:
               try {
                 console.log(`In-place transactional data restore attempt ${attempt}/4 ...`);
                 await run('psql', args, { env: pgEnvFromUrl(dbUrl), echoStdout: true, echoStderr: true });
-                console.log('In-place data restore COMMITTED successfully.');
+                if (!(await commitMarkerExists(dbUrl, backupName))) throw new Error('psql returned success but the durable commit marker is missing. Refusing to report restore success.');
+                console.log('In-place data restore COMMITTED successfully; durable commit marker confirmed.');
                 if (backupFp !== currentFp) {
                   console.warn('IMPORTANT: data was restored successfully into the CURRENT target schema. The target schema itself was not rolled back to the backup schema. For exact schema+data restoration, use a clean/new target.');
                 }
@@ -966,21 +1287,13 @@ jobs:
                 const msg = safeError(err);
 
                 if (isTransientPgConnectionError(msg)) {
-                  // A dropped client connection aborts an uncommitted PostgreSQL transaction.
-                  // If COMMIT may already have succeeded, verification resolves the ambiguity
-                  // before any retry. Replaying this snapshot is safe because the existing-target
-                  // path truncates and reloads the same data inside one transaction.
-                  try {
-                    await verifyTarget(dbUrl, manifest, 'existing');
-                    console.warn('Transient connection loss occurred, but post-restore verification PASSED. Treating the restore as committed successfully.');
-                    return;
-                  } catch (_) {
-                    if (attempt < 4) {
-                      const wait = [5, 10, 20][attempt - 1] || 20;
-                      console.warn(`Transient PostgreSQL connection loss; target does not yet verify as restored. Retrying in ${wait}s.`);
-                      await sleep(wait * 1000);
-                      continue;
-                    }
+                  const outcome = await resolveTransientRestoreOutcome(dbUrl, backupName, 'Existing-target restore');
+                  if (outcome === 'committed') return;
+                  if (attempt < 4) {
+                    const wait = [5, 10, 20][attempt - 1] || 20;
+                    console.warn(`Existing-target transaction is confirmed NOT committed. Retrying in ${wait}s.`);
+                    await sleep(wait * 1000);
+                    continue;
                   }
                 }
 
@@ -996,8 +1309,9 @@ jobs:
             throw lastErr;
           }
 
-          async function verifyTarget(dbUrl, manifest, restoreMode) {
+          async function verifyTarget(dbUrl, manifest, restoreMode, options = {}) {
             const errors = [], warnings = [];
+            const mutableCountsAsWarnings = options.mutableCountsAsWarnings === true;
             const expectedCounts = manifest.verification?.copy_row_counts || {};
             for (const [key, expected] of Object.entries(expectedCounts)) {
               const idx = key.indexOf('.');
@@ -1007,7 +1321,10 @@ jobs:
               if (!isApp && !isKeyManaged) continue;
               const actual = await countTable(dbUrl, key);
               if (actual === null) errors.push(`missing table ${key}`);
-              else if (Number(actual) !== Number(expected)) errors.push(`row count ${key}: expected=${expected}, actual=${actual}`);
+              else if (Number(actual) !== Number(expected)) {
+                const msg = `row count ${key}: expected=${expected}, actual=${actual}`;
+                (mutableCountsAsWarnings ? warnings : errors).push(msg);
+              }
             }
 
             // Independent hard verification for critical Supabase data. Do not rely only on
@@ -1027,7 +1344,10 @@ jobs:
               }
               const actual = await countTable(dbUrl, key);
               if (actual === null) errors.push(`missing critical table ${key}`);
-              else if (Number(actual) !== Number(expected)) errors.push(`critical row count ${key}: expected=${expected}, actual=${actual}`);
+              else if (Number(actual) !== Number(expected)) {
+                const msg = `critical row count ${key}: expected=${expected}, actual=${actual}`;
+                (mutableCountsAsWarnings ? warnings : errors).push(msg);
+              }
             }
 
             // auth/storage/realtime are Supabase-managed schemas. A normal logical dump/restore
@@ -1066,9 +1386,17 @@ jobs:
             const actualRealtime = (await collectRealtimeTables(dbUrl)).slice().sort();
             if (JSON.stringify(expectedRealtime) !== JSON.stringify(actualRealtime)) errors.push('supabase_realtime publication membership differs');
 
-            const targetExt = new Set(await collectExtensionNames(dbUrl));
+            const actualExtensions = await collectExtensions(dbUrl);
+            const targetExt = new Set(actualExtensions.map(x => x.name));
             const missingExt = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !targetExt.has(x));
             if (missingExt.length) errors.push(`missing extensions: ${missingExt.join(', ')}`);
+            const actualExtByName = new Map(actualExtensions.map(x => [x.name, x.version]));
+            for (const ext of (manifest.verification?.extensions || [])) {
+              const actualVersion = actualExtByName.get(ext.name);
+              if (actualVersion && ext.version && actualVersion !== ext.version) {
+                warnings.push(`extension version differs for ${ext.name}: backup=${ext.version}, target=${actualVersion}`);
+              }
+            }
 
             const storageObjects = Number(manifest.verification?.storage_objects_count || 0);
             const vaultSecrets = Number(manifest.verification?.vault_secrets_count || 0);
@@ -1093,6 +1421,7 @@ jobs:
 
             const target = await loadTarget();
             await psql(target.dbUrl, 'SELECT 1;');
+            await cleanupOwnedRestoreGuard(target.dbUrl);
             const { name, manifest } = await downloadAndVerifyBackup();
             const state = await inspectTarget(target.dbUrl);
 
@@ -1100,18 +1429,28 @@ jobs:
             if (state.clean) {
               restoreMode = 'clean';
               console.log('Target is CLEAN/NEW. Running full official Supabase logical restore (roles + schema + data).');
-              await restoreCleanTarget(target.dbUrl, manifest);
+              await restoreCleanTarget(target.dbUrl, manifest, name);
             } else {
               restoreMode = 'existing';
               console.log(`Target already contains data: ${state.dirty.join(', ')}`);
               console.log('Existing-target mode: local schema preflight -> structural COPY compatibility preflight -> transactional data restore.');
               console.warn('PRE-RESTORE SAFETY SNAPSHOT IS DISABLED: after a successful COMMIT, this workflow has no automatic copy of the immediately previous target state.');
               const currentSchemaFile = await captureCurrentSchemaForPreflight(target.dbUrl);
-              await restoreExistingCompatibleTarget(target.dbUrl, manifest, currentSchemaFile);
+              await restoreExistingCompatibleTarget(target.dbUrl, manifest, currentSchemaFile, name);
             }
 
-            await verifyTarget(target.dbUrl, manifest, restoreMode);
-            console.log('RESTORE SUCCESS: database restore and verification completed.');
+            // All mutable row counts were already hard-checked inside the transaction before
+            // COMMIT. After COMMIT, application traffic may legitimately change counts immediately,
+            // so post-commit count drift is diagnostic rather than proof of restore failure.
+            await verifyTarget(target.dbUrl, manifest, restoreMode, { mutableCountsAsWarnings: true });
+            try {
+              await cleanupOwnedRestoreGuard(target.dbUrl);
+            } catch (e) {
+              // The restore is already durably committed and verified. Marker cleanup is housekeeping;
+              // failing it must not turn a successful restore into a false operational failure.
+              console.warn(`WARNING: restore succeeded but internal commit-marker cleanup could not complete: ${safeError(e)}`);
+            }
+            console.log('RESTORE SUCCESS: durable COMMIT confirmation and post-restore verification completed.');
             console.log(`Target D1 suffix: [${suffix}] | Backup: [${name}] | Backup source: [${manifest.source_slug || 'unknown'}]`);
           }
 
@@ -1120,11 +1459,11 @@ jobs:
             process.exit(1);
           });
           NODE
-          node restore_direct_v14.js
+          node restore_direct_v19.js
 
       - name: Cleanup local credentials and work files
         if: always()
         run: |
           set +e
           rm -f ~/.config/rclone/rclone.conf
-          rm -rf restore_work restore_direct_v14.js
+          rm -rf restore_work restore_direct_v19.js
