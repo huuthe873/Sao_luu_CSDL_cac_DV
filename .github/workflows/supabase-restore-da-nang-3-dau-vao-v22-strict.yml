@@ -1,4 +1,4 @@
-name: Phuc hoi da nang Supabase v22 STRICT - 3 dau vao
+name: Phuc hoi da nang Supabase v23 PORTABLE - 3 dau vao
 
 on:
   workflow_dispatch:
@@ -110,7 +110,7 @@ jobs:
           INPUT_BACKUP_FILE: ${{ github.event.inputs.backup_file }}
         run: |
           set -euo pipefail
-          cat > restore_direct_v22.js <<'NODE'
+          cat > restore_direct_v23.js <<'NODE'
           const fs = require('fs');
           const path = require('path');
           const crypto = require('crypto');
@@ -659,30 +659,45 @@ jobs:
           }
 
           async function assertManagedPlatformCompatibility(dbUrl, manifest) {
+            // Supabase-managed schemas may gain platform objects over time. A new target can therefore
+            // legitimately contain EXTRA auth/storage/realtime triggers or policies. What matters for
+            // source fidelity is that every signature captured from SOURCE still exists on TARGET.
             const expectedManaged = manifest.verification?.managed_schema_signatures || { triggers: [], policies: [] };
             const actualManaged = await collectManagedSignatures(dbUrl);
             const expTriggers = (expectedManaged.triggers || []).slice().sort();
             const actTriggers = (actualManaged.triggers || []).slice().sort();
             const expPolicies = (expectedManaged.policies || []).slice().sort();
             const actPolicies = (actualManaged.policies || []).slice().sort();
-            if (JSON.stringify(expTriggers) !== JSON.stringify(actTriggers) || JSON.stringify(expPolicies) !== JSON.stringify(actPolicies)) {
-              throw new Error(`Managed Supabase schema compatibility check FAILED (auth/storage/realtime trigger or policy signatures differ). Strict mode stops before changing application data because Supabase CLI schema dumps intentionally exclude managed schemas.`);
+            const actTriggerSet = new Set(actTriggers);
+            const actPolicySet = new Set(actPolicies);
+            const missingTriggers = expTriggers.filter(x => !actTriggerSet.has(x));
+            const missingPolicies = expPolicies.filter(x => !actPolicySet.has(x));
+            if (missingTriggers.length || missingPolicies.length) {
+              throw new Error(`Managed Supabase compatibility FAILED: TARGET is missing ${missingTriggers.length} SOURCE trigger signature(s) and ${missingPolicies.length} SOURCE policy signature(s). No application data was changed.`);
+            }
+            const extraTriggerCount = actTriggers.filter(x => !new Set(expTriggers).has(x)).length;
+            const extraPolicyCount = actPolicies.filter(x => !new Set(expPolicies).has(x)).length;
+            if (extraTriggerCount || extraPolicyCount) {
+              console.warn(`Managed Supabase platform on TARGET has additional objects (triggers=${extraTriggerCount}, policies=${extraPolicyCount}); these TARGET platform additions are preserved.`);
             }
 
+            // Extension migration rule: all extensions used by SOURCE must exist on TARGET. Extra TARGET
+            // extensions and version differences are not fatal by themselves: Supabase projects can expose
+            // different default extension versions, while the supported migration procedure only requires
+            // the necessary extensions to be enabled. Actual schema/data execution remains the hard gate.
             const expectedExt = new Map((manifest.verification?.extensions || []).map(x => [x.name, x.version]));
             const actualExt = new Map((await collectExtensions(dbUrl)).map(x => [x.name, x.version]));
             const missing = [];
-            const extra = [];
             const versionMismatch = [];
             for (const [name, version] of expectedExt) {
               if (!actualExt.has(name)) missing.push(name);
               else if (version && actualExt.get(name) !== version) versionMismatch.push(`${name}: source=${version}, target=${actualExt.get(name)}`);
             }
-            for (const name of actualExt.keys()) if (!expectedExt.has(name)) extra.push(name);
-            if (missing.length) throw new Error(`Target is missing required extension(s): ${missing.join(', ')}`);
-            if (extra.length) throw new Error(`Target has extension(s) absent from the backup source in STRICT mode: ${extra.join(', ')}`);
-            if (versionMismatch.length) throw new Error(`Extension version mismatch in STRICT mode: ${versionMismatch.join('; ')}`);
-            console.log('Managed Supabase trigger/policy signatures and exact extension set/versions match the backup source.');
+            if (missing.length) throw new Error(`TARGET is still missing SOURCE extension(s) after reconciliation: ${missing.join(', ')}`);
+            if (versionMismatch.length) console.warn(`Extension version difference(s) accepted after availability check: ${versionMismatch.join('; ')}`);
+            const extra = [...actualExt.keys()].filter(name => !expectedExt.has(name));
+            if (extra.length) console.warn(`TARGET has additional extension(s) not present on SOURCE; preserved as platform/local state: ${extra.join(', ')}`);
+            console.log('Managed Supabase SOURCE signatures are present and all SOURCE extensions are enabled on TARGET.');
           }
 
           function assertCrossProjectLogicalLimitations(manifest) {
@@ -954,25 +969,69 @@ jobs:
             });
           }
 
-          async function ensureExtensions(dbUrl, manifest) {
-            const target = new Set(await collectExtensionNames(dbUrl));
-            const missing = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !target.has(x) && x !== 'plpgsql');
-            for (const ext of missing) {
-              if (!/^[A-Za-z0-9_-]+$/.test(ext)) throw new Error(`Unsafe extension name: ${ext}`);
-              console.log(`Target missing extension [${ext}]; attempting CREATE EXTENSION IF NOT EXISTS.`);
-              await psql(dbUrl, `CREATE EXTENSION IF NOT EXISTS "${ext.replace(/"/g, '""')}";`);
-            }
-            const after = new Set(await collectExtensionNames(dbUrl));
-            const stillMissing = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !after.has(x));
-            if (stillMissing.length) throw new Error(`Target is missing required extensions: ${stillMissing.join(', ')}`);
+          async function availableExtensionVersions(dbUrl, ext) {
+            const q = sqlLiteral(ext);
+            const out = await psql(dbUrl, `
+              SELECT COALESCE(json_agg(json_build_object(
+                'version', version,
+                'installed', installed,
+                'superuser', superuser,
+                'trusted', trusted
+              ) ORDER BY version)::text, '[]')
+              FROM pg_available_extension_versions
+              WHERE name = ${q};`);
+            try { return JSON.parse(out || '[]'); }
+            catch (_) { throw new Error(`Could not inspect available versions for extension [${ext}].`); }
           }
 
-          async function assertRequiredExtensionsPresent(dbUrl, manifest) {
-            const target = new Set(await collectExtensionNames(dbUrl));
-            const missing = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !target.has(x));
-            if (missing.length) {
-              throw new Error(`Existing target is missing required extension(s): ${missing.join(', ')}. No target data was changed. Enable the extension(s) first or restore to a clean/new project.`);
+          async function ensureExtensions(dbUrl, manifest) {
+            const expected = (manifest.verification?.extensions || [])
+              .filter(x => x && typeof x.name === 'string' && x.name.trim())
+              .map(x => ({ name: x.name.trim(), version: String(x.version || '').trim() }));
+            const current = new Map((await collectExtensions(dbUrl)).map(x => [x.name, x.version]));
+            const created = [];
+
+            for (const item of expected) {
+              const ext = item.name;
+              if (current.has(ext)) continue;
+              if (ext === 'plpgsql') throw new Error('TARGET unexpectedly has no plpgsql extension. Refusing restore.');
+              if (!/^[A-Za-z0-9_-]+$/.test(ext)) throw new Error(`Unsafe extension name: ${ext}`);
+
+              const available = await availableExtensionVersions(dbUrl, ext);
+              if (!available.length) {
+                throw new Error(`SOURCE requires extension [${ext}]${item.version ? ` version ${item.version}` : ''}, but it is not available on TARGET. No application data was changed.`);
+              }
+
+              const exactAvailable = item.version && available.some(v => String(v.version) === item.version);
+              const quoted = `"${ext.replace(/"/g, '""')}"`;
+              const versionClause = exactAvailable ? ` VERSION ${sqlLiteral(item.version)}` : '';
+              if (item.version && !exactAvailable) {
+                console.warn(`SOURCE extension [${ext}] version ${item.version} is not offered by TARGET; enabling TARGET default version. Restore SQL/data verification will remain authoritative.`);
+              }
+
+              console.log(`AUTO-EXTENSION: enabling missing SOURCE extension [${ext}]${exactAvailable ? ` at version ${item.version}` : ''} on TARGET.`);
+              try {
+                await psql(dbUrl, `CREATE EXTENSION IF NOT EXISTS ${quoted}${versionClause};`);
+                created.push(ext);
+              } catch (err) {
+                throw new Error(`Could not enable required SOURCE extension [${ext}] on TARGET. Supabase migrations require non-default SOURCE extensions to be enabled on the new project. Original error: ${safeError(err)}`);
+              }
+              const now = new Map((await collectExtensions(dbUrl)).map(x => [x.name, x.version]));
+              if (!now.has(ext)) throw new Error(`CREATE EXTENSION for [${ext}] returned without error, but the extension is still not installed.`);
+              current.set(ext, now.get(ext));
+              console.log(`AUTO-EXTENSION OK: [${ext}] installed as version ${now.get(ext)}.`);
             }
+
+            const after = new Map((await collectExtensions(dbUrl)).map(x => [x.name, x.version]));
+            const stillMissing = expected.map(x => x.name).filter(x => !after.has(x));
+            if (stillMissing.length) throw new Error(`TARGET is missing required SOURCE extension(s): ${stillMissing.join(', ')}`);
+
+            const versionDiff = expected
+              .filter(x => x.version && after.has(x.name) && after.get(x.name) !== x.version)
+              .map(x => `${x.name}: source=${x.version}, target=${after.get(x.name)}`);
+            if (versionDiff.length) console.warn(`Extension version difference(s): ${versionDiff.join('; ')}`);
+            if (created.length) console.log(`AUTO-EXTENSION reconciliation completed; newly enabled: ${created.join(', ')}`);
+            else console.log('AUTO-EXTENSION reconciliation: all SOURCE extensions were already enabled on TARGET.');
           }
 
           function makeTransactionalVerificationSql(manifest, file) {
@@ -1289,14 +1348,13 @@ jobs:
                   }
                 }
 
-                throw new Error(`STRICT clean-target restore was rejected and rolled back. v22 does not auto-comment or weaken any source schema/role statement because that would make an exact restore unverifiable. Original error: ${msg}`);
+                throw new Error(`STRICT clean-target restore was rejected and rolled back. v23 does not auto-comment or weaken any source application schema/role statement because that would make an exact restore unverifiable. Original error: ${msg}`);
               }
             }
             throw lastErr;
           }
 
           async function restoreExistingCompatibleTarget(dbUrl, manifest, currentSchemaFile, currentRolesFile, backupName) {
-            await assertRequiredExtensionsPresent(dbUrl, manifest);
             await assertManagedPlatformCompatibility(dbUrl, manifest);
             const backupFp = manifest.__runtime_schema_fingerprint || schemaFingerprint('restore_work/schema.sql');
             const currentFp = schemaFingerprint(currentSchemaFile);
@@ -1306,13 +1364,22 @@ jobs:
             console.log(`Schema fingerprint target=${currentFp}`);
             console.log(`Roles fingerprint backup=${backupRolesFp}`);
             console.log(`Roles fingerprint target=${currentRolesFp}`);
+            // Existing-target mode is intentionally DATA-ONLY: the target schema/roles are preserved.
+            // Therefore SOURCE-vs-TARGET fingerprint differences are diagnostic, not fatal. The hard
+            // gates are COPY structural compatibility + PostgreSQL transactional validation. We also
+            // remember the pre-restore TARGET fingerprints and require them to remain unchanged after COMMIT.
+            manifest.__runtime_existing_target_schema_fingerprint = currentFp;
+            manifest.__runtime_existing_target_roles_fingerprint = currentRolesFp;
             if (backupFp !== currentFp) {
-              throw new Error('STRICT existing-target restore refused: application schema fingerprint differs from the selected backup. No target data was changed. Use a clean/new target or recreate the exact source schema first.');
+              console.warn('PORTABLE existing-target mode: SOURCE backup schema fingerprint differs from TARGET. DATA-ONLY restore will preserve TARGET schema and validate every restored COPY table/constraint transactionally. For an exact SOURCE schema clone, use a clean/new TARGET.');
+            } else {
+              console.log('SOURCE and TARGET application schema fingerprints match before DATA-ONLY restore.');
             }
             if (backupRolesFp !== currentRolesFp) {
-              throw new Error('STRICT existing-target restore refused: database role dump fingerprint differs from the selected backup. No target data was changed.');
+              console.warn('PORTABLE existing-target mode: SOURCE role fingerprint differs from TARGET. DATA-ONLY restore preserves TARGET roles. For an exact SOURCE role clone, use a clean/new TARGET.');
+            } else {
+              console.log('SOURCE and TARGET role fingerprints match before DATA-ONLY restore.');
             }
-            console.log('Exact application schema + role fingerprints match before DATA-ONLY restore.');
 
             const historyData = manifest.has_migration_history && fs.existsSync('restore_work/history_data.sql')
               ? 'restore_work/history_data.sql' : null;
@@ -1374,7 +1441,7 @@ jobs:
               inPlaceHistoryData = path.resolve('restore_work/history_data_inplace.sql');
               skippedSetvals += await makeInPlaceDataFile(historyData, inPlaceHistoryData);
             }
-            console.log(`In-place sequence protection: CONTINUE IDENTITY; skipped ${skippedSetvals} source pg_dump setval statement(s). v22 will preserve the target sequence phase and advance only sequences that would collide with restored rows.`);
+            console.log(`In-place sequence protection: CONTINUE IDENTITY; skipped ${skippedSetvals} source pg_dump setval statement(s). v23 will preserve the target sequence phase and advance only sequences that would collide with restored rows.`);
 
             const realtimeFile = path.resolve('restore_work/realtime.sql');
             await makeRealtimeSql(manifest, dbUrl, realtimeFile);
@@ -1442,12 +1509,24 @@ jobs:
             const postRoles = path.resolve('restore_work/post_restore_roles.sql');
             await dumpWithRetry(dbUrl, postSchema, [], `[${suffix}] post-restore schema verification dump`);
             await dumpWithRetry(dbUrl, postRoles, ['--role-only'], `[${suffix}] post-restore roles verification dump`);
-            const expectedSchemaFp = manifest.__runtime_schema_fingerprint || schemaFingerprint('restore_work/schema.sql');
-            const expectedRolesFp = manifest.__runtime_roles_fingerprint || dumpSemanticFingerprint('restore_work/roles.sql');
+            const sourceSchemaFp = manifest.__runtime_schema_fingerprint || schemaFingerprint('restore_work/schema.sql');
+            const sourceRolesFp = manifest.__runtime_roles_fingerprint || dumpSemanticFingerprint('restore_work/roles.sql');
+            const expectedSchemaFp = restoreMode === 'existing'
+              ? (manifest.__runtime_existing_target_schema_fingerprint || sourceSchemaFp)
+              : sourceSchemaFp;
+            const expectedRolesFp = restoreMode === 'existing'
+              ? (manifest.__runtime_existing_target_roles_fingerprint || sourceRolesFp)
+              : sourceRolesFp;
             const actualSchemaFp = schemaFingerprint(postSchema);
             const actualRolesFp = dumpSemanticFingerprint(postRoles);
-            if (actualSchemaFp !== expectedSchemaFp) errors.push(`application schema fingerprint mismatch after restore: expected=${expectedSchemaFp}, actual=${actualSchemaFp}`);
-            if (actualRolesFp !== expectedRolesFp) errors.push(`database roles fingerprint mismatch after restore: expected=${expectedRolesFp}, actual=${actualRolesFp}`);
+            if (actualSchemaFp !== expectedSchemaFp) {
+              errors.push(`${restoreMode === 'existing' ? 'TARGET schema changed during DATA-ONLY restore' : 'application schema fingerprint mismatch after full restore'}: expected=${expectedSchemaFp}, actual=${actualSchemaFp}`);
+            }
+            if (actualRolesFp !== expectedRolesFp) {
+              errors.push(`${restoreMode === 'existing' ? 'TARGET roles changed during DATA-ONLY restore' : 'database roles fingerprint mismatch after full restore'}: expected=${expectedRolesFp}, actual=${actualRolesFp}`);
+            }
+            if (restoreMode === 'existing' && actualSchemaFp !== sourceSchemaFp) warnings.push(`DATA-ONLY mode preserved TARGET schema; it is not byte-semantic-identical to SOURCE backup schema. source=${sourceSchemaFp}, target=${actualSchemaFp}`);
+            if (restoreMode === 'existing' && actualRolesFp !== sourceRolesFp) warnings.push(`DATA-ONLY mode preserved TARGET roles; they are not byte-semantic-identical to SOURCE backup roles. source=${sourceRolesFp}, target=${actualRolesFp}`);
             const expectedCounts = manifest.__runtime_all_copy_row_counts || manifest.verification?.copy_row_counts || {};
             for (const [key, expected] of Object.entries(expectedCounts)) {
               const actual = await countTable(dbUrl, key);
@@ -1502,15 +1581,15 @@ jobs:
 
             if (JSON.stringify(actualTriggers) !== JSON.stringify(expectedTriggers)) {
               const d = signatureDiff(expectedTriggers, actualTriggers);
-              errors.push(`managed-schema trigger signatures differ (source=${expectedTriggers.length}, target=${actualTriggers.length}, source-only=${d.missing.length}, target-only=${d.extra.length}). ${restoreMode === 'existing' ? 'This is expected to be possible in in-place DATA-ONLY mode because the current target managed schema is intentionally preserved.' : 'Supabase-managed platform objects can differ between projects/versions; custom auth/storage trigger changes must be migrated separately.'}`);
-              if (d.missing.length) warnings.push(`managed trigger source-only sample: ${d.missing.slice(0, 3).join(' || ')}`);
-              if (d.extra.length) warnings.push(`managed trigger target-only sample: ${d.extra.slice(0, 3).join(' || ')}`);
+              if (d.missing.length) errors.push(`TARGET is missing ${d.missing.length} SOURCE managed-schema trigger signature(s).`);
+              if (d.missing.length) warnings.push(`managed trigger SOURCE-only sample: ${d.missing.slice(0, 3).join(' || ')}`);
+              if (d.extra.length) warnings.push(`TARGET has ${d.extra.length} additional Supabase-managed trigger signature(s); preserved.`);
             }
             if (JSON.stringify(actualPolicies) !== JSON.stringify(expectedPolicies)) {
               const d = signatureDiff(expectedPolicies, actualPolicies);
-              errors.push(`managed-schema policy signatures differ (source=${expectedPolicies.length}, target=${actualPolicies.length}, source-only=${d.missing.length}, target-only=${d.extra.length}). ${restoreMode === 'existing' ? 'This is expected to be possible in in-place DATA-ONLY mode because the current target managed schema is intentionally preserved.' : 'Supabase-managed platform objects can differ between projects/versions; custom auth/storage RLS changes must be migrated separately.'}`);
-              if (d.missing.length) warnings.push(`managed policy source-only sample: ${d.missing.slice(0, 3).join(' || ')}`);
-              if (d.extra.length) warnings.push(`managed policy target-only sample: ${d.extra.slice(0, 3).join(' || ')}`);
+              if (d.missing.length) errors.push(`TARGET is missing ${d.missing.length} SOURCE managed-schema policy signature(s).`);
+              if (d.missing.length) warnings.push(`managed policy SOURCE-only sample: ${d.missing.slice(0, 3).join(' || ')}`);
+              if (d.extra.length) warnings.push(`TARGET has ${d.extra.length} additional Supabase-managed policy signature(s); preserved.`);
             }
 
             const expectedRealtime = (manifest.verification?.realtime_publication_tables || []).slice().sort();
@@ -1520,17 +1599,17 @@ jobs:
             const actualExtensions = await collectExtensions(dbUrl);
             const targetExt = new Set(actualExtensions.map(x => x.name));
             const missingExt = (manifest.verification?.extensions || []).map(x => x.name).filter(x => !targetExt.has(x));
-            if (missingExt.length) errors.push(`missing extensions: ${missingExt.join(', ')}`);
+            if (missingExt.length) errors.push(`missing SOURCE extensions after restore: ${missingExt.join(', ')}`);
             const actualExtByName = new Map(actualExtensions.map(x => [x.name, x.version]));
             const expectedExtNames = new Set((manifest.verification?.extensions || []).map(x => x.name));
             for (const ext of (manifest.verification?.extensions || [])) {
               const actualVersion = actualExtByName.get(ext.name);
               if (actualVersion && ext.version && actualVersion !== ext.version) {
-                errors.push(`extension version differs for ${ext.name}: backup=${ext.version}, target=${actualVersion}`);
+                warnings.push(`extension version differs for ${ext.name}: backup=${ext.version}, target=${actualVersion}; TARGET-supported version was retained`);
               }
             }
             const extraExtensions = actualExtensions.map(x => x.name).filter(name => !expectedExtNames.has(name));
-            if (extraExtensions.length) errors.push(`target has extension(s) absent from backup source: ${extraExtensions.join(', ')}`);
+            if (extraExtensions.length) warnings.push(`TARGET has additional extension(s) absent from SOURCE; preserved: ${extraExtensions.join(', ')}`);
 
             const storageObjects = Number(manifest.verification?.storage_objects_count || 0);
             const vaultSecrets = Number(manifest.verification?.vault_secrets_count || 0);
@@ -1579,6 +1658,10 @@ jobs:
               console.log('AUTO existing-target mode: schema capture -> structural COPY compatibility preflight -> transactional DATA-ONLY restore.');
               console.warn('TARGET schema is preserved in this mode. If it is incompatible with the selected SOURCE backup, the workflow stops before data change or PostgreSQL rolls the transaction back.');
               console.warn('PRE-RESTORE SAFETY SNAPSHOT IS DISABLED: after a successful COMMIT, this workflow has no automatic copy of the immediately previous TARGET state.');
+              // Supabase new projects may not enable all extensions used by an older SOURCE (notably pg_graphql,
+              // and pg_cron when Cron was enabled). Reconcile required SOURCE extensions before capturing the
+              // target schema so the structural fingerprint reflects the effective restore environment.
+              await ensureExtensions(target.dbUrl, manifest);
               const currentSchemaFile = await captureCurrentSchemaForPreflight(target.dbUrl);
               const currentRolesFile = await captureCurrentRolesForPreflight(target.dbUrl);
               await restoreExistingCompatibleTarget(target.dbUrl, manifest, currentSchemaFile, currentRolesFile, name);
@@ -1602,11 +1685,11 @@ jobs:
             process.exit(1);
           });
           NODE
-          node restore_direct_v22.js
+          node restore_direct_v23.js
 
       - name: Cleanup local credentials and work files
         if: always()
         run: |
           set +e
           rm -f ~/.config/rclone/rclone.conf
-          rm -rf restore_work restore_direct_v22.js
+          rm -rf restore_work restore_direct_v23.js
